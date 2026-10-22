@@ -1,0 +1,5 @@
+menu "ADS-B monitor"
+    config ADSB_HOSTNAME
+        string "DHCP hostname"
+        default "adsb"
+endmenu

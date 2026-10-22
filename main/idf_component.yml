@@ -1,0 +1,25 @@
+dependencies:
+  lvgl/lvgl: "~9.2"
+  espressif/esp_lcd_st7796: "^1"
+  espressif/esp_lcd_touch_ft5x06: "^1"
+  # Shared infrastructure — mianesp repo, main branch (same pattern as nmtv-clock).
+  nvsstoragemanager:
+    git: git@github.com:mianos/mianesp.git
+    path: components/nvsstoragemanager
+    version: main
+  wifimanager:
+    git: git@github.com:mianos/mianesp.git
+    path: components/wifimanager
+    version: main
+  webserver:
+    git: git@github.com:mianos/mianesp.git
+    path: components/webserver
+    version: main
+  jsonwrapper:
+    git: git@github.com:mianos/mianesp.git
+    path: components/jsonwrapper
+    version: main
+  settingsbase:
+    git: git@github.com:mianos/mianesp.git
+    path: components/settingsbase
+    version: main

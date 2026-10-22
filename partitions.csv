@@ -1,0 +1,9 @@
+# Dual-OTA layout for 16MB flash. The image is about 1.5MB; 6MB slots leave
+# room to grow without another partition change, which needs a USB flash.
+# nvs stays at 0x9000 so Wi-Fi credentials and settings survive a re-layout.
+# Name,     Type, SubType, Offset,   Size,    Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+otadata,    data, ota,     0xf000,   0x2000,
+phy_init,   data, phy,     0x11000,  0x1000,
+ota_0,      app,  ota_0,   0x20000,  0x600000,
+ota_1,      app,  ota_1,   ,         0x600000,

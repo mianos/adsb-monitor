@@ -1,0 +1,14 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+.DS_Store
+*.tags
+tags
+
+# Per-machine editor/tooling config (absolute paths, serial ports)
+.vscode/
+
+# Local flash backups
+*-backup.bin

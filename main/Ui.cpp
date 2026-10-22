@@ -66,6 +66,7 @@ struct State {
   double homeLat = 0, homeLon = 0;
   int radiusNm = 25;
   Ground ground = Ground::Group;
+  bool configOpen = false;
   int zoom = 0;
   std::shared_ptr<const Snapshot> snap = std::make_shared<Snapshot>();
   uint32_t generation = 0;
@@ -86,6 +87,7 @@ bool s_inHomeDirty = false;
 double s_inLat = 0, s_inLon = 0;
 int s_inRadius = 25;
 Ground s_inGround = Ground::Group;
+void (*s_groundChosen)(Ground) = nullptr;
 
 // List rows are created once and refilled, so a poll arriving mid-scroll
 // doesn't delete the row under the finger.
@@ -104,6 +106,11 @@ lv_obj_t* s_link;
 lv_obj_t* s_range;
 lv_obj_t* s_zoomOut;
 lv_obj_t* s_zoomIn;
+lv_obj_t* s_configBtn;
+lv_obj_t* s_config;
+constexpr Ground kGroundModes[] = {Ground::Group, Ground::Show, Ground::Hide};
+constexpr const char* kGroundNames[] = {"Group", "Show each", "Hide"};
+lv_obj_t* s_groundOpts[3];
 lv_obj_t* s_list;
 Row s_rows[kMaxRows];
 lv_obj_t* s_detail;
@@ -386,16 +393,28 @@ const Aircraft* findSelected() {
   return nullptr;
 }
 
+void setHidden(lv_obj_t* o, bool hidden) {
+  if (hidden) {
+    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// The top of the panel shows settings, else the selected aircraft, else the list.
+void showView() {
+  const bool detail = !s.configOpen && !s.selected.empty();
+  setHidden(s_config, !s.configOpen);
+  setHidden(s_detail, !detail);
+  setHidden(s_list, s.configOpen || detail);
+  lv_obj_set_state(s_configBtn, LV_STATE_CHECKED, s.configOpen);
+}
+
 void refreshDetail() {
   const Aircraft* a = findSelected();
-  if (!a) {
-    s.selected.clear();
-    lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(s_list, LV_OBJ_FLAG_HIDDEN);
-    return;
-  }
-  lv_obj_add_flag(s_list, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_remove_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
+  if (!a) s.selected.clear();
+  showView();
+  if (!a) return;
   lv_label_set_text(s_detailTitle, a->label().c_str());
   lv_obj_set_style_text_color(s_detailTitle, altColor(*a), 0);
 
@@ -530,6 +549,21 @@ void onZoomClicked(lv_event_t* e) {
   setZoom(s.zoom + static_cast<int>(reinterpret_cast<intptr_t>(lv_event_get_user_data(e))));
 }
 
+void updateGroundButtons() {
+  for (int i = 0; i < 3; ++i) lv_obj_set_state(s_groundOpts[i], LV_STATE_CHECKED, s.ground == kGroundModes[i]);
+}
+
+void onGroundClicked(lv_event_t* e) {
+  const Ground mode = kGroundModes[reinterpret_cast<intptr_t>(lv_event_get_user_data(e))];
+  setGround(mode);
+  if (s_groundChosen) s_groundChosen(mode);
+}
+
+void onConfigClicked(lv_event_t*) {
+  s.configOpen = !s.configOpen;
+  showView();
+}
+
 void updateTrails() {
   std::unordered_map<std::string, std::deque<Point>> next;
   for (const Aircraft& a : s.snap->aircraft) {
@@ -568,6 +602,7 @@ void onScopeClicked(lv_event_t*) {
   }
   if (best) {
     s.selected = best->hex;
+    s.configOpen = false;
   } else {
     s.zoom = (s.zoom + 1) % kZoomLevels;
     updateRange();
@@ -727,6 +762,7 @@ void tick(lv_timer_t*) {
   if (groundChanged) {
     const Aircraft* sel = findSelected();
     if (sel && sel->onGround && s.ground == Ground::Hide) s.selected.clear();
+    updateGroundButtons();
     rebuildList();
     refreshDetail();
     lv_obj_invalidate(s_scope);
@@ -755,20 +791,23 @@ lv_obj_t* plainBox(lv_obj_t* parent) {
   return o;
 }
 
-// "+" zooms in (a smaller range), as on a map.
-lv_obj_t* zoomButton(lv_obj_t* parent, const char* symbol, int step, lv_align_t align) {
+constexpr int kButtonH = 28;
+
+lv_obj_t* button(lv_obj_t* parent, const char* text, const lv_font_t* font, int x, int w, lv_event_cb_t cb,
+                 intptr_t arg) {
   lv_obj_t* b = lv_button_create(parent);
   lv_obj_remove_style_all(b);
-  lv_obj_set_size(b, 44, 28);
+  lv_obj_set_size(b, w, kButtonH);
   lv_obj_set_style_radius(b, 6, 0);
   lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(b, kButton, 0);
   lv_obj_set_style_bg_color(b, kButtonPressed, LV_STATE_PRESSED);
   lv_obj_set_style_opa(b, LV_OPA_40, LV_STATE_DISABLED);
-  lv_obj_align(b, align, 0, -2);
-  lv_obj_add_event_cb(b, onZoomClicked, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<intptr_t>(step)));
+  lv_obj_align(b, LV_ALIGN_BOTTOM_LEFT, x, -2);
+  lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, reinterpret_cast<void*>(arg));
   lv_obj_t* l = lv_label_create(b);
-  lv_label_set_text(l, symbol);
+  lv_label_set_text(l, text);
+  lv_obj_set_style_text_font(l, font, 0);
   lv_obj_set_style_text_color(l, kText, 0);
   lv_obj_center(l);
   return b;
@@ -850,6 +889,33 @@ void init(double homeLat, double homeLon, int radiusNm) {
   lv_label_set_text(hint, "tap to go back");
   lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, 0);
 
+  s_config = plainBox(panel);
+  lv_obj_set_pos(s_config, kInset, kInset);
+  lv_obj_set_size(s_config, kInnerW, kListH);
+  lv_obj_set_style_bg_color(s_config, kPanelBg, 0);
+  lv_obj_set_style_pad_all(s_config, 4, 0);
+  lv_obj_remove_flag(s_config, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(s_config, LV_OBJ_FLAG_HIDDEN);
+
+  lv_obj_t* title = lv_label_create(s_config);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(title, kText, 0);
+  lv_label_set_text(title, "Settings");
+  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  lv_obj_t* groundTitle = lv_label_create(s_config);
+  lv_obj_set_style_text_font(groundTitle, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(groundTitle, kDim, 0);
+  lv_label_set_text(groundTitle, "Aircraft on the ground");
+  lv_obj_align(groundTitle, LV_ALIGN_TOP_LEFT, 0, 28);
+  for (int i = 0; i < 3; ++i) {
+    s_groundOpts[i] = button(s_config, kGroundNames[i], &lv_font_montserrat_14, 0, kInnerW - 8, onGroundClicked, i);
+    lv_obj_align(s_groundOpts[i], LV_ALIGN_TOP_LEFT, 0, 46 + i * (kButtonH + 4));
+    lv_obj_set_style_bg_color(s_groundOpts[i], kRing, LV_STATE_CHECKED);
+  }
+  lv_obj_t* done = button(s_config, "Done", &lv_font_montserrat_14, 0, kInnerW - 8, onConfigClicked, 0);
+  lv_obj_align(done, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
   lv_obj_t* controls = plainBox(panel);
   lv_obj_set_pos(controls, kInset, kInset + kListH);
   lv_obj_set_size(controls, kInnerW, kControlsH);
@@ -882,13 +948,21 @@ void init(double homeLat, double homeLon, int radiusNm) {
   lv_label_set_text(s_link, "");
   lv_obj_align(s_link, LV_ALIGN_TOP_LEFT, 2, 34);
 
-  s_zoomOut = zoomButton(controls, LV_SYMBOL_MINUS, -1, LV_ALIGN_BOTTOM_LEFT);
-  s_zoomIn = zoomButton(controls, LV_SYMBOL_PLUS, 1, LV_ALIGN_BOTTOM_RIGHT);
+  // [-] range [+] [settings]; "+" zooms in (a smaller range), as on a map.
+  constexpr int kZoomW = 32, kRangeW = 56, kConfigW = kInnerW - 2 * kZoomW - kRangeW - 2;
+  s_zoomOut = button(controls, LV_SYMBOL_MINUS, &lv_font_montserrat_14, 0, kZoomW, onZoomClicked, -1);
+  s_zoomIn = button(controls, LV_SYMBOL_PLUS, &lv_font_montserrat_14, kZoomW + kRangeW, kZoomW, onZoomClicked, 1);
+  s_configBtn =
+      button(controls, LV_SYMBOL_SETTINGS, &lv_font_montserrat_14, kInnerW - kConfigW, kConfigW, onConfigClicked, 0);
+  lv_obj_set_style_bg_color(s_configBtn, kButtonPressed, LV_STATE_CHECKED);
   s_range = lv_label_create(controls);
+  lv_obj_set_width(s_range, kRangeW);
+  lv_obj_set_style_text_align(s_range, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(s_range, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(s_range, kRingText, 0);
-  lv_obj_align(s_range, LV_ALIGN_BOTTOM_MID, 0, -8);
+  lv_obj_align(s_range, LV_ALIGN_BOTTOM_LEFT, kZoomW, -8);
   updateRange();
+  updateGroundButtons();
 
   lv_timer_create(tick, 250, nullptr);
 }
@@ -905,6 +979,8 @@ void setGround(Ground mode) {
   std::lock_guard<std::mutex> g(s_inMutex);
   s_inGround = mode;
 }
+
+void onGroundChosen(void (*cb)(Ground mode)) { s_groundChosen = cb; }
 
 void setNet(Net net, const std::string& message) {
   std::lock_guard<std::mutex> g(s_inMutex);

@@ -109,6 +109,13 @@ extern "C" void app_main(void) {
 
   settings.onChange("tz", [] { applyTz(settings.tz); });
   settings.onChange("ground", [] { ui::setGround(ui::Ground(settings.ground)); });
+  // Same path as a POST to /config, so the page and the stored value follow the button.
+  ui::onGroundChosen([](ui::Ground mode) {
+    JsonWrapper change;
+    change.AddItem("ground", static_cast<int>(mode));
+    settings.loadFromJson(change);
+    settings.save();
+  });
   settings.onChange("brightness", [] { display::setBrightness(settings.brightness); });
   auto refeed = [] {
     const feed::Config c = settings.feedConfig();

@@ -37,7 +37,7 @@ and a rectangular one over the panel:
   - traffic: the average number in the air over the last hour, and how many
     different aircraft flew in that hour (counted since boot until it has run
     an hour)
-  - **−** and **+** to change the range
+  - **−** and **+** to change the range, and the gear for settings
 
 Touch:
 
@@ -46,6 +46,9 @@ Touch:
   Tap the details to go back.
 - **Tap an empty part of the radar**, or use **+** and **−**, to zoom in to ½ or ¼
   of the range. Tapping the radar at ¼ takes it back to full range.
+- **Tap the gear** to choose how aircraft on the ground are shown: grouped into
+  count badges, each one, or hidden. The choice is saved, the same as on the
+  settings page. Tap **Done** or the gear again to go back to the list.
 
 ## First start
 

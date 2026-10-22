@@ -194,4 +194,30 @@ bool lock(uint32_t timeoutMs) {
 
 void unlock() { xSemaphoreGiveRecursive(s_mutex); }
 
+namespace {
+struct SnapshotJob {
+  lv_draw_buf_t* buf;
+  SemaphoreHandle_t done;
+  bool ok = false;
+};
+}  // namespace
+
+bool snapshot(lv_draw_buf_t* buf) {
+  SnapshotJob job{buf, xSemaphoreCreateBinary()};
+  if (!job.done) return false;
+  {
+    Guard guard;
+    lv_async_call(
+        [](void* arg) {
+          auto* j = static_cast<SnapshotJob*>(arg);
+          j->ok = lv_snapshot_take_to_draw_buf(lv_screen_active(), LV_COLOR_FORMAT_RGB565, j->buf) == LV_RESULT_OK;
+          xSemaphoreGive(j->done);
+        },
+        &job);
+  }
+  xSemaphoreTake(job.done, portMAX_DELAY);  // the LVGL task always runs the call
+  vSemaphoreDelete(job.done);
+  return job.ok;
+}
+
 }  // namespace display

@@ -24,7 +24,7 @@ struct Aircraft {
   float distNm = 0;
   float bearing = 0;  // degrees true from home
 
-  const std::string& label() const { return flight.empty() ? hex : flight; }
+  const std::string& label() const { return !flight.empty() ? flight : !reg.empty() ? reg : hex; }
 };
 
 struct Snapshot {

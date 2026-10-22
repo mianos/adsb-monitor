@@ -5,6 +5,8 @@
 #include <cmath>
 #include <string>
 
+#include "Board.h"
+#include "Display.h"
 #include "Feed.h"
 #include "LogBuffer.h"
 #include "WebPage.h"
@@ -59,6 +61,10 @@ const char* resetReasonName(esp_reset_reason_t r) {
   }
 }
 
+void putLe(uint8_t* at, uint32_t v, int bytes) {
+  for (int i = 0; i < bytes; ++i) at[i] = static_cast<uint8_t>(v >> (8 * i));
+}
+
 void restartSoon() {
   vTaskDelay(pdMS_TO_TICKS(500));  // let the response flush
   esp_restart();
@@ -78,6 +84,7 @@ esp_err_t WebApi::start() {
       {.uri = "/config", .method = HTTP_POST, .handler = config_post_handler, .user_ctx = this},
       {.uri = "/aircraft", .method = HTTP_GET, .handler = aircraft_get_handler, .user_ctx = this},
       {.uri = "/reboot", .method = HTTP_POST, .handler = reboot_post_handler, .user_ctx = this},
+      {.uri = "/screenshot", .method = HTTP_GET, .handler = screenshot_get_handler, .user_ctx = this},
   };
   for (const httpd_uri_t& uri : routes) {
     r = httpd_register_uri_handler(server, &uri);
@@ -111,6 +118,9 @@ void WebApi::populate_healthz_fields(WebContext*, JsonWrapper& json) {
   // Lowest free stack ever seen on the main loop's task, in bytes.
   if (TaskHandle_t main = xTaskGetHandle("main")) {
     json.AddItem("main_stack_min_free", static_cast<int>(uxTaskGetStackHighWaterMark(main)));
+  }
+  if (TaskHandle_t lvgl = xTaskGetHandle("lvgl")) {
+    json.AddItem("lvgl_stack_min_free", static_cast<int>(uxTaskGetStackHighWaterMark(lvgl)));
   }
 }
 
@@ -266,6 +276,48 @@ esp_err_t WebApi::aircraft_get_handler(httpd_req_t* req) {
   httpd_resp_set_type(req, "application/json");
   esp_err_t r = httpd_resp_sendstr(req, out);
   cJSON_free(out);
+  return r;
+}
+
+// The screen as a 24-bit BMP. LVGL's own heap is too small for a frame, so it
+// renders into a PSRAM buffer.
+esp_err_t WebApi::screenshot_get_handler(httpd_req_t* req) {
+  const int32_t width = board::kWidth, height = board::kHeight;
+  const uint32_t stride = lv_draw_buf_width_to_stride(width, LV_COLOR_FORMAT_RGB565);
+  const uint32_t size = stride * height;
+  auto* pixels = static_cast<uint8_t*>(heap_caps_aligned_alloc(LV_DRAW_BUF_ALIGN, size, MALLOC_CAP_SPIRAM));
+  if (!pixels) return sendJsonError(req, 500, "no memory for a frame");
+  lv_draw_buf_t buf;
+  lv_draw_buf_init(&buf, width, height, LV_COLOR_FORMAT_RGB565, stride, pixels, size);
+  if (!display::snapshot(&buf)) {
+    heap_caps_free(pixels);
+    return sendJsonError(req, 500, "snapshot failed");
+  }
+
+  const uint32_t rowBytes = (width * 3 + 3) & ~3u;
+  uint8_t header[54] = {'B', 'M'};
+  putLe(header + 2, sizeof header + rowBytes * height, 4);
+  putLe(header + 10, sizeof header, 4);
+  putLe(header + 14, 40, 4);
+  putLe(header + 18, width, 4);
+  putLe(header + 22, height, 4);  // positive: rows run bottom-up
+  putLe(header + 26, 1, 2);
+  putLe(header + 28, 24, 2);
+  httpd_resp_set_type(req, "image/bmp");
+  esp_err_t r = httpd_resp_send_chunk(req, reinterpret_cast<const char*>(header), sizeof header);
+  std::string row(rowBytes, '\0');
+  for (int32_t y = height - 1; y >= 0 && r == ESP_OK; --y) {
+    const auto* src = reinterpret_cast<const uint16_t*>(pixels + y * buf.header.stride);
+    for (int32_t x = 0; x < width; ++x) {
+      const uint16_t p = src[x];
+      row[x * 3] = static_cast<char>((p & 0x1f) * 255 / 31);
+      row[x * 3 + 1] = static_cast<char>(((p >> 5) & 0x3f) * 255 / 63);
+      row[x * 3 + 2] = static_cast<char>((p >> 11) * 255 / 31);
+    }
+    r = httpd_resp_send_chunk(req, row.data(), rowBytes);
+  }
+  heap_caps_free(pixels);
+  if (r == ESP_OK) r = httpd_resp_send_chunk(req, nullptr, 0);
   return r;
 }
 

@@ -26,6 +26,7 @@ class WebApi : public WebServer {
   static esp_err_t config_post_handler(httpd_req_t* req);
   static esp_err_t aircraft_get_handler(httpd_req_t* req);
   static esp_err_t reboot_post_handler(httpd_req_t* req);
+  static esp_err_t screenshot_get_handler(httpd_req_t* req);
 
   Settings& settings_;
 };

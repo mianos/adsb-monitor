@@ -222,7 +222,7 @@ void drawScope(lv_event_t* e) {
   cross.p1 = {static_cast<lv_value_precise_t>(cx), static_cast<lv_value_precise_t>(cy - kScopeR)};
   cross.p2 = {static_cast<lv_value_precise_t>(cx), static_cast<lv_value_precise_t>(cy + kScopeR)};
   lv_draw_line(layer, &cross);
-  drawLabel(layer, "N", &lv_font_montserrat_14, kRingText, cx + 4, box.y1 + 1, 20);
+  drawLabel(layer, "N", &lv_font_montserrat_14, kRingText, cx - 14, box.y1 + 1, 20);  // ring labels are right of the line
   snprintf(buf, sizeof buf, "%d nm", static_cast<int>(viewNm() + 0.5f));
   drawLabel(layer, buf, &lv_font_montserrat_14, kRingText, box.x1 + 4, box.y2 - 18, 80);
 
@@ -441,6 +441,8 @@ void rebuildList() {
 
     lv_obj_t* name = lv_label_create(row);
     lv_label_set_text(name, a.label().c_str());
+    lv_obj_set_width(name, 98);  // leaves room for the altitude on the right
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(name, altColor(a), 0);
     lv_obj_align(name, LV_ALIGN_TOP_LEFT, 0, 0);

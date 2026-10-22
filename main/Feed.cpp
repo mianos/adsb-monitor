@@ -87,9 +87,10 @@ bool httpGet(const std::string& url, const Config& feedCfg, Body& body, int& sta
   return err == ESP_OK;
 }
 
+// '@' is ADS-B's "no character", so an unset callsign arrives as "@@@@@@@@".
 std::string trimmed(const char* s) {
   std::string out(s ? s : "");
-  while (!out.empty() && out.back() == ' ') out.pop_back();
+  while (!out.empty() && (out.back() == ' ' || out.back() == '@')) out.pop_back();
   return out;
 }
 

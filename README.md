@@ -5,6 +5,8 @@ A desk radar for planes around you, on the Freenove FNK0104S (ESP32-S3 with a 4.
 aggregator ([adsb.fi](https://adsb.fi) by default) over Wi-Fi, or from your own
 receiver on the local network.
 
+![The radar and aircraft list on the display](docs/screenshot.png)
+
 ## What it shows
 
 The screen is landscape:
@@ -63,6 +65,7 @@ The same settings as JSON:
 curl http://adsb.mianos.com/config
 curl -X POST -d '{"radius_nm":40}' http://adsb.mianos.com/config
 curl http://adsb.mianos.com/aircraft
+curl -o screen.bmp http://adsb.mianos.com/screenshot   # what the display shows now
 ```
 
 ## Data providers

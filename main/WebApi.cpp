@@ -122,6 +122,11 @@ void WebApi::populate_healthz_fields(WebContext*, JsonWrapper& json) {
   if (TaskHandle_t lvgl = xTaskGetHandle("lvgl")) {
     json.AddItem("lvgl_stack_min_free", static_cast<int>(uxTaskGetStackHighWaterMark(lvgl)));
   }
+  // OTA receive and image verification run on this task.
+  if (TaskHandle_t httpd = xTaskGetHandle("httpd")) {
+    json.AddItem("httpd_stack_min_free", static_cast<int>(uxTaskGetStackHighWaterMark(httpd)));
+  }
+  json.AddItem("lvgl_slowest_ms", static_cast<int>(display::takeSlowestMs()));
 }
 
 // Raw .bin body streamed into the inactive OTA slot, which becomes the next boot
@@ -165,7 +170,8 @@ esp_err_t WebApi::firmware_post_handler(httpd_req_t* req) {
   resp.AddItem("status", std::string("ok, rebooting"));
   resp.AddItem("partition", std::string(target->label));
   esp_err_t r = send_json(req, resp);
-  ESP_LOGW(TAG, "OTA complete, rebooting into %s", target->label);
+  ESP_LOGW(TAG, "OTA complete, rebooting into %s (httpd stack min free %u)", target->label,
+           static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
   vTaskDelay(pdMS_TO_TICKS(500));  // let the response flush
   esp_restart();
   return r;

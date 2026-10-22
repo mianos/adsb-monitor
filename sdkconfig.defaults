@@ -38,3 +38,9 @@ CONFIG_LV_USE_LOG=n
 CONFIG_LV_USE_PERF_MONITOR=n
 # GET /screenshot
 CONFIG_LV_USE_SNAPSHOT=y
+
+# LVGL renders the radar in software; -O2 rather than the default -Og.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# OTA receive and image verification run inline on the HTTP server task.
+CONFIG_WEBSERVER_TASK_STACK_SIZE=8192

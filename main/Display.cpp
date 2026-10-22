@@ -1,5 +1,7 @@
 #include "Display.h"
 
+#include <atomic>
+
 #include "Board.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
@@ -26,6 +28,7 @@ esp_lcd_panel_handle_t s_panel = nullptr;
 esp_lcd_touch_handle_t s_touch = nullptr;
 lv_display_t* s_disp = nullptr;
 SemaphoreHandle_t s_mutex = nullptr;
+std::atomic<uint32_t> s_slowestUs{0};
 
 bool onColorDone(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t*, void* ctx) {
   lv_display_flush_ready(static_cast<lv_display_t*>(ctx));
@@ -58,7 +61,10 @@ uint32_t tickMs() { return esp_timer_get_time() / 1000; }
 void lvglTask(void*) {
   while (true) {
     lock();
+    const int64_t start = esp_timer_get_time();
     const uint32_t next = lv_timer_handler();
+    const uint32_t took = esp_timer_get_time() - start;
+    if (took > s_slowestUs) s_slowestUs = took;
     unlock();
     vTaskDelay(pdMS_TO_TICKS(next < 5 ? 5 : (next > 30 ? 30 : next)));
   }
@@ -193,6 +199,8 @@ bool lock(uint32_t timeoutMs) {
 }
 
 void unlock() { xSemaphoreGiveRecursive(s_mutex); }
+
+uint32_t takeSlowestMs() { return (s_slowestUs.exchange(0) + 500) / 1000; }
 
 namespace {
 struct SnapshotJob {

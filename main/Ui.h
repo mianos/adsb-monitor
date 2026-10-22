@@ -1,8 +1,9 @@
 #pragma once
 #include <string>
 
-// Landscape 480x320: radar scope on the left 320x320, clock, status and the
-// nearest-aircraft list (or the selected aircraft's details) on the right.
+// Landscape 480x320: a round radar scope on the left 320x320 (the case hides the
+// corners), and on the right a scrolling nearest-aircraft list (or the selected
+// aircraft's details) above the clock, status and range +/- buttons.
 // Tap a plane on the scope or a list row to select it; tap empty scope to zoom.
 namespace ui {
 

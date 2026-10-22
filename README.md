@@ -9,10 +9,12 @@ receiver on the local network.
 
 ## What it shows
 
-The screen is landscape:
+The screen is landscape, laid out for a case with a round window over the radar
+and a rectangular one over the panel:
 
 - **Radar (left):** you're in the middle, north is up, and there are three range
-  rings with their distance in nautical miles. Each plane is a small arrow
+  rings with their distance in nautical miles. Nothing is drawn in the corners
+  outside the circle. Each plane is a small arrow
   pointing the way it's flying, with its callsign and altitude next to it. A
   fading trail shows where it's been. The colour shows the altitude:
   - grey: on the ground
@@ -24,17 +26,26 @@ The screen is landscape:
   - red: the plane is squawking an emergency
 
   Altitudes above 18,000 ft are shown as flight levels, for example FL350.
-- **Clock and status (top right):** the time, how many aircraft are in range, and how
-  long ago the data was updated. This turns red with STALE if the last update failed.
-- **List (right):** the nearest 30 aircraft, nearest first.
+- **List (top right):** up to 30 aircraft, one line each with callsign, altitude
+  and distance in nm. Flying aircraft come first, nearest first, then those on
+  the ground. Swipe to scroll.
+- **Status (bottom right):**
+  - the time, how many aircraft are in the air now, and how long ago the data
+    was updated (red with STALE if the last update failed)
+  - the provider and how long its last request took, plus the HTTP error and
+    rate-limit counts if it sends them
+  - traffic: the average number in the air over the last hour, and how many
+    different aircraft flew in that hour (counted since boot until it has run
+    an hour)
+  - **−** and **+** to change the range
 
 Touch:
 
 - **Tap a plane or a list row** to see its details: registration, type, altitude,
   climb or descent rate, speed, track, distance and bearing, squawk, and ICAO hex.
   Tap the details to go back.
-- **Tap an empty part of the radar** to zoom in to ½ or ¼ of the range. Another tap
-  takes it back to full range.
+- **Tap an empty part of the radar**, or use **+** and **−**, to zoom in to ½ or ¼
+  of the range. Tapping the radar at ¼ takes it back to full range.
 
 ## First start
 

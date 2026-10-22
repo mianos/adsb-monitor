@@ -6,6 +6,7 @@
 #include <ctime>
 #include <deque>
 #include <mutex>
+#include <numeric>
 #include <unordered_map>
 #include <vector>
 
@@ -13,6 +14,7 @@
 #include "Display.h"
 #include "Feed.h"
 #include "Geo.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 
 namespace ui {
@@ -20,12 +22,22 @@ namespace {
 
 constexpr int kScope = board::kHeight;  // square scope, full height
 constexpr int kScopeR = kScope / 2 - 10;
+// The case shows the scope through a round window; the square's corners are
+// hidden, so everything on the scope is kept inside this radius.
+constexpr int kVisibleR = kScope / 2 - 2;
 constexpr int kPanelX = kScope;
 constexpr int kPanelW = board::kWidth - kScope;
+// Margin inside the panel's rectangular window, so its frame doesn't cover text.
+constexpr int kInset = 4;
+constexpr int kInnerW = kPanelW - 2 * kInset;
+constexpr int kControlsH = 96;
+constexpr int kListH = board::kHeight - 2 * kInset - kControlsH;
+constexpr int kRowH = 24;
 constexpr int kMaxRows = 30;
 constexpr size_t kTrailLen = 40;
 constexpr int kPickRadiusPx = 22;
 constexpr float kZoom[] = {1.0f, 0.5f, 0.25f};
+constexpr int kZoomLevels = sizeof kZoom / sizeof kZoom[0];
 constexpr float kClusterPx = 18;
 
 const lv_color_t kBg = lv_color_hex(0x000000);
@@ -34,6 +46,9 @@ const lv_color_t kRingText = lv_color_hex(0x3f8f55);
 const lv_color_t kText = lv_color_hex(0xe6e6e6);
 const lv_color_t kDim = lv_color_hex(0x8a8a8a);
 const lv_color_t kPanelBg = lv_color_hex(0x101418);
+const lv_color_t kDivider = lv_color_hex(0x263038);
+const lv_color_t kButton = lv_color_hex(0x263038);
+const lv_color_t kButtonPressed = lv_color_hex(0x3a4a56);
 const lv_color_t kSelect = lv_color_hex(0xffffff);
 const lv_color_t kEmergency = lv_color_hex(0xff3030);
 
@@ -72,11 +87,25 @@ double s_inLat = 0, s_inLon = 0;
 int s_inRadius = 25;
 Ground s_inGround = Ground::Group;
 
+// List rows are created once and refilled, so a poll arriving mid-scroll
+// doesn't delete the row under the finger.
+struct Row {
+  lv_obj_t* obj;
+  lv_obj_t* name;
+  lv_obj_t* alt;
+  lv_obj_t* dist;
+};
+
 lv_obj_t* s_scope;
 lv_obj_t* s_scopeMsg;
 lv_obj_t* s_clock;
 lv_obj_t* s_status;
+lv_obj_t* s_link;
+lv_obj_t* s_range;
+lv_obj_t* s_zoomOut;
+lv_obj_t* s_zoomIn;
 lv_obj_t* s_list;
+Row s_rows[kMaxRows];
 lv_obj_t* s_detail;
 lv_obj_t* s_detailTitle;
 lv_obj_t* s_detailBody;
@@ -106,6 +135,20 @@ bool drawnSingly(const Aircraft& a) {
 
 bool overlaps(const lv_area_t& a, const lv_area_t& b) {
   return a.x1 <= b.x2 && b.x1 <= a.x2 && a.y1 <= b.y2 && b.y1 <= a.y2;
+}
+
+bool inWindow(const lv_area_t& a, int cx, int cy) {
+  const int r2 = (kVisibleR - 2) * (kVisibleR - 2);
+  for (int x : {a.x1, a.x2}) {
+    for (int y : {a.y1, a.y2}) {
+      if ((x - cx) * (x - cx) + (y - cy) * (y - cy) > r2) return false;
+    }
+  }
+  return true;
+}
+
+void rangeText(char* buf, size_t len, float nm, const char* suffix) {
+  snprintf(buf, len, nm < 10 ? "%.1f%s" : "%.0f%s", nm, suffix);
 }
 
 const Aircraft* findSelected();
@@ -208,8 +251,7 @@ void drawScope(lv_event_t* e) {
   for (int i = 1; i <= 3; ++i) {
     ring.radius = kScopeR * i / 3;
     lv_draw_arc(layer, &ring);
-    const float nm = viewNm() * i / 3;
-    snprintf(buf, sizeof buf, nm < 10 ? "%.1f" : "%.0f", nm);
+    rangeText(buf, sizeof buf, viewNm() * i / 3, "");
     drawLabel(layer, buf, &lv_font_montserrat_12, kRingText, cx + 3, cy - ring.radius + 1, 40);
   }
   lv_draw_line_dsc_t cross;
@@ -222,11 +264,10 @@ void drawScope(lv_event_t* e) {
   cross.p1 = {static_cast<lv_value_precise_t>(cx), static_cast<lv_value_precise_t>(cy - kScopeR)};
   cross.p2 = {static_cast<lv_value_precise_t>(cx), static_cast<lv_value_precise_t>(cy + kScopeR)};
   lv_draw_line(layer, &cross);
-  drawLabel(layer, "N", &lv_font_montserrat_14, kRingText, cx - 14, box.y1 + 1, 20);  // ring labels are right of the line
-  snprintf(buf, sizeof buf, "%d nm", static_cast<int>(viewNm() + 0.5f));
-  drawLabel(layer, buf, &lv_font_montserrat_14, kRingText, box.x1 + 4, box.y2 - 18, 80);
+  // Inside the outer ring, opposite its distance label, so the window's edge can't cut it.
+  drawLabel(layer, "N", &lv_font_montserrat_14, kRingText, cx - 14, cy - kScopeR + 1, 20);
 
-  const float limit = viewNm() * 1.08f;
+  const float limit = viewNm() * kVisibleR / kScopeR;
   lv_draw_line_dsc_t trail;
   lv_draw_line_dsc_init(&trail);
   trail.width = 1;
@@ -241,7 +282,7 @@ void drawScope(lv_event_t* e) {
       float x0, y0, x1, y1;
       toScope(pts[i - 1].eastNm, pts[i - 1].northNm, x0, y0);
       toScope(pts[i].eastNm, pts[i].northNm, x1, y1);
-      if (std::hypot(x1, y1) > kScopeR * 1.08f) continue;
+      if (std::hypot(x0, y0) > kVisibleR || std::hypot(x1, y1) > kVisibleR) continue;
       trail.p1 = pt(cx + x0, cy + y0);
       trail.p2 = pt(cx + x1, cy + y1);
       lv_draw_line(layer, &trail);
@@ -303,7 +344,6 @@ void drawScope(lv_event_t* e) {
   for (const Aircraft& a : s.snap->aircraft) {
     if (a.hex != s.selected) order.push_back(&a);
   }
-  const lv_area_t scopeBox = {box.x1, box.y1, box.x1 + kScope - 1, box.y1 + kScope - 1};
   for (const Aircraft* a : order) {
     if (a->distNm > limit || !drawnSingly(*a)) continue;
     float east, north, x, y;
@@ -319,9 +359,7 @@ void drawScope(lv_event_t* e) {
                                 {px - w / 2, py + 10}};
     for (const lv_point_t& sp : spots) {
       const lv_area_t area = {sp.x, sp.y, sp.x + w - 1, sp.y + h - 1};
-      const bool inside = area.x1 >= scopeBox.x1 && area.y1 >= scopeBox.y1 && area.x2 <= scopeBox.x2 &&
-                          area.y2 <= scopeBox.y2;
-      if (!inside || std::any_of(taken.begin(), taken.end(), [&](const lv_area_t& t) { return overlaps(t, area); }))
+      if (!inWindow(area, cx, cy) || std::any_of(taken.begin(), taken.end(), [&](const lv_area_t& t) { return overlaps(t, area); }))
         continue;
       drawLabel(layer, buf, &lv_font_montserrat_12, a->hex == s.selected ? kSelect : altColor(*a), sp.x, sp.y, w);
       taken.push_back(area);
@@ -410,7 +448,6 @@ void onDetailClicked(lv_event_t*) {
 }
 
 void rebuildList() {
-  lv_obj_clean(s_list);
   s.rowHex.clear();
   // Airborne first (nearest first, as the snapshot is sorted), then parked.
   std::vector<const Aircraft*> rows;
@@ -422,47 +459,75 @@ void rebuildList() {
       if (a.onGround) rows.push_back(&a);
     }
   }
-  for (const Aircraft* entry : rows) {
-    const Aircraft& a = *entry;
-    if (static_cast<int>(s.rowHex.size()) >= kMaxRows) break;
-    lv_obj_t* row = lv_obj_create(s_list);
-    lv_obj_set_size(row, lv_pct(100), 38);
-    lv_obj_set_style_pad_all(row, 2, 0);
-    lv_obj_set_style_pad_left(row, 4, 0);
-    lv_obj_set_style_bg_color(row, kPanelBg, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
-    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_border_color(row, lv_color_hex(0x263038), 0);
-    lv_obj_set_style_border_width(row, 1, 0);
-    lv_obj_set_style_radius(row, 0, 0);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(row, onRowClicked, LV_EVENT_CLICKED, reinterpret_cast<void*>(s.rowHex.size()));
-
-    lv_obj_t* name = lv_label_create(row);
-    lv_label_set_text(name, a.label().c_str());
-    lv_obj_set_width(name, 98);  // leaves room for the altitude on the right
-    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(name, altColor(a), 0);
-    lv_obj_align(name, LV_ALIGN_TOP_LEFT, 0, 0);
-
-    lv_obj_t* alt = lv_label_create(row);
-    lv_label_set_text(alt, altText(a).c_str());
-    lv_obj_set_style_text_font(alt, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(alt, kText, 0);
-    lv_obj_align(alt, LV_ALIGN_TOP_RIGHT, -2, 1);
-
-    char sub[40];
-    snprintf(sub, sizeof sub, "%s  %.1f nm", a.type.empty() ? "?" : a.type.c_str(), a.distNm);
-    lv_obj_t* info = lv_label_create(row);
-    lv_label_set_text(info, sub);
-    lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(info, kDim, 0);
-    lv_obj_align(info, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-
+  for (int i = 0; i < kMaxRows; ++i) {
+    const Row& r = s_rows[i];
+    if (i >= static_cast<int>(rows.size())) {
+      lv_obj_add_flag(r.obj, LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+    const Aircraft& a = *rows[i];
+    lv_label_set_text(r.name, a.label().c_str());
+    lv_obj_set_style_text_color(r.name, altColor(a), 0);
+    lv_label_set_text(r.alt, altText(a).c_str());
+    char dist[12];
+    rangeText(dist, sizeof dist, a.distNm, "");
+    lv_label_set_text(r.dist, dist);
+    lv_obj_remove_flag(r.obj, LV_OBJ_FLAG_HIDDEN);
     s.rowHex.push_back(a.hex);
   }
+}
+
+lv_obj_t* rowLabel(lv_obj_t* row, const lv_font_t* font, lv_color_t color, int x, int w, lv_text_align_t align) {
+  lv_obj_t* l = lv_label_create(row);
+  lv_obj_set_size(l, w, lv_font_get_line_height(font));
+  lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+  lv_label_set_text(l, "");
+  lv_obj_set_style_text_font(l, font, 0);
+  lv_obj_set_style_text_color(l, color, 0);
+  lv_obj_set_style_text_align(l, align, 0);
+  lv_obj_align(l, LV_ALIGN_LEFT_MID, x, 0);
+  return l;
+}
+
+// One line per aircraft: callsign, altitude, distance in nm. Type and the rest
+// are in the details.
+void createRows() {
+  for (int i = 0; i < kMaxRows; ++i) {
+    lv_obj_t* row = lv_obj_create(s_list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), kRowH);
+    lv_obj_set_style_pad_hor(row, 3, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_color(row, kDivider, 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_bg_color(row, kButtonPressed, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_STATE_PRESSED);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN));
+    lv_obj_add_event_cb(row, onRowClicked, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+    const int w = kInnerW - 6;
+    s_rows[i] = {row, rowLabel(row, &lv_font_montserrat_14, kText, 0, 74, LV_TEXT_ALIGN_LEFT),
+                 rowLabel(row, &lv_font_montserrat_12, kText, 74, 40, LV_TEXT_ALIGN_RIGHT),
+                 rowLabel(row, &lv_font_montserrat_12, kDim, 114, w - 114, LV_TEXT_ALIGN_RIGHT)};
+  }
+}
+
+void updateRange() {
+  char buf[16];
+  rangeText(buf, sizeof buf, viewNm(), " nm");
+  lv_label_set_text(s_range, buf);
+  lv_obj_set_state(s_zoomOut, LV_STATE_DISABLED, s.zoom == 0);
+  lv_obj_set_state(s_zoomIn, LV_STATE_DISABLED, s.zoom == kZoomLevels - 1);
+}
+
+void setZoom(int zoom) {
+  s.zoom = std::clamp(zoom, 0, kZoomLevels - 1);
+  updateRange();
+  lv_obj_invalidate(s_scope);
+}
+
+void onZoomClicked(lv_event_t* e) {
+  setZoom(s.zoom + static_cast<int>(reinterpret_cast<intptr_t>(lv_event_get_user_data(e))));
 }
 
 void updateTrails() {
@@ -504,30 +569,113 @@ void onScopeClicked(lv_event_t*) {
   if (best) {
     s.selected = best->hex;
   } else {
-    s.zoom = (s.zoom + 1) % (sizeof kZoom / sizeof kZoom[0]);
+    s.zoom = (s.zoom + 1) % kZoomLevels;
+    updateRange();
   }
   refreshDetail();
   lv_obj_invalidate(s_scope);
+}
+
+int flyingNow() {
+  return std::count_if(s.snap->aircraft.begin(), s.snap->aircraft.end(),
+                       [](const Aircraft& a) { return !a.onGround; });
+}
+
+// Different aircraft seen flying in the last hour. In PSRAM, as internal RAM is tight.
+struct Seen {
+  uint32_t icao;
+  uint32_t minute;
+};
+constexpr int kSeenCap = 2048;
+constexpr uint32_t kHourMin = 60;
+Seen* s_seen;
+int s_seenCount;
+
+// The in-the-air count once a minute, for the hourly average.
+int s_samples[kHourMin];
+int s_sampleCount;
+int s_sampleNext;
+uint32_t s_sampleMinute = UINT32_MAX;
+
+uint32_t icaoKey(const std::string& hex) {
+  const bool tisb = !hex.empty() && hex[0] == '~';  // non-ICAO address
+  return strtoul(hex.c_str() + tisb, nullptr, 16) | (tisb ? 0x1000000u : 0);
+}
+
+void recordSeen() {
+  if (!s_seen) return;
+  const uint32_t now = esp_timer_get_time() / 60000000;
+  for (const Aircraft& a : s.snap->aircraft) {
+    if (a.onGround) continue;
+    const uint32_t key = icaoKey(a.hex);
+    Seen* end = s_seen + s_seenCount;
+    Seen* it = std::find_if(s_seen, end, [key](const Seen& e) { return e.icao == key; });
+    if (it != end) {
+      it->minute = now;
+    } else if (s_seenCount < kSeenCap) {
+      s_seen[s_seenCount++] = {key, now};
+    }
+  }
+  Seen* end = std::remove_if(s_seen, s_seen + s_seenCount, [now](const Seen& e) { return now - e.minute >= kHourMin; });
+  s_seenCount = end - s_seen;
+  if (now != s_sampleMinute) {
+    s_sampleMinute = now;
+    s_samples[s_sampleNext] = flyingNow();
+    s_sampleNext = (s_sampleNext + 1) % kHourMin;
+    s_sampleCount = std::min<int>(s_sampleCount + 1, kHourMin);
+  }
 }
 
 void updateStatus() {
   const int64_t now = esp_timer_get_time();
   char buf[96];
   if (s.net == Net::Unprovisioned) {
-    snprintf(buf, sizeof buf, "No Wi-Fi set up");
+    snprintf(buf, sizeof buf, "No Wi-Fi\nset up");
   } else if (s.net == Net::Connecting) {
-    snprintf(buf, sizeof buf, "Wi-Fi connecting...");
+    snprintf(buf, sizeof buf, "Wi-Fi\nconnecting");
   } else if (!s.error.empty() && s.snap->fetchedUs == 0) {
     snprintf(buf, sizeof buf, "%s", s.error.c_str());
   } else if (s.snap->fetchedUs == 0) {
-    snprintf(buf, sizeof buf, "Fetching...");
+    snprintf(buf, sizeof buf, "Fetching");
   } else {
     const int age = static_cast<int>((now - s.snap->fetchedUs) / 1000000);
-    snprintf(buf, sizeof buf, "%u aircraft  %d nm\n%s %ds ago", static_cast<unsigned>(s.snap->aircraft.size()),
-             s.radiusNm, s.error.empty() ? "updated" : "STALE", age);
+    snprintf(buf, sizeof buf, "%d in the air\n%s%ds ago", flyingNow(), s.error.empty() ? "" : "STALE ", age);
   }
   lv_label_set_text(s_status, buf);
   lv_obj_set_style_text_color(s_status, s.error.empty() || s.snap->fetchedUs == 0 ? kDim : kEmergency, 0);
+}
+
+// Provider, request time, HTTP status if not 200 and any rate-limit headers the
+// provider sends; then the hour's average in the air and how many different
+// aircraft flew (both since boot, if that's sooner).
+void updateLink() {
+  const feed::Status st = feed::status();
+  std::string text = feed::provider();
+  char part[32];
+  if (st.fetchMs >= 0) {
+    snprintf(part, sizeof part, "  %.1fs", st.fetchMs / 1000.0f);
+    text += part;
+  }
+  if (st.httpStatus != 0 && st.httpStatus != 200) {
+    snprintf(part, sizeof part, "  HTTP %d", st.httpStatus);
+    text += part;
+  }
+  if (st.rateRemaining >= 0) {
+    snprintf(part, sizeof part, "  %d left", st.rateRemaining);
+    text += part;
+  }
+  if (st.retryAfterS > 0) {
+    snprintf(part, sizeof part, "  wait %ds", st.retryAfterS);
+    text += part;
+  }
+  if (s_sampleCount > 0) {
+    const int sum = std::accumulate(s_samples, s_samples + s_sampleCount, 0);
+    snprintf(part, sizeof part, "\nAvg %d  Flights 1h %d", (sum + s_sampleCount / 2) / s_sampleCount, s_seenCount);
+  } else {
+    snprintf(part, sizeof part, "\nFlights 1h %d", s_seenCount);
+  }
+  text += part;
+  if (text != lv_label_get_text(s_link)) lv_label_set_text(s_link, text.c_str());
 }
 
 void updateClock() {
@@ -573,6 +721,7 @@ void tick(lv_timer_t*) {
   }
   if (homeDirty) {
     s.trails.clear();
+    updateRange();
     lv_obj_invalidate(s_scope);
   }
   if (groundChanged) {
@@ -587,12 +736,14 @@ void tick(lv_timer_t*) {
   if (gen != s.generation) {
     s.generation = gen;
     s.snap = feed::latest();
+    recordSeen();
     updateTrails();
     rebuildList();
     if (!s.selected.empty()) refreshDetail();
     lv_obj_invalidate(s_scope);
   }
   updateStatus();
+  updateLink();
   updateClock();
 }
 
@@ -604,6 +755,25 @@ lv_obj_t* plainBox(lv_obj_t* parent) {
   return o;
 }
 
+// "+" zooms in (a smaller range), as on a map.
+lv_obj_t* zoomButton(lv_obj_t* parent, const char* symbol, int step, lv_align_t align) {
+  lv_obj_t* b = lv_button_create(parent);
+  lv_obj_remove_style_all(b);
+  lv_obj_set_size(b, 44, 28);
+  lv_obj_set_style_radius(b, 6, 0);
+  lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(b, kButton, 0);
+  lv_obj_set_style_bg_color(b, kButtonPressed, LV_STATE_PRESSED);
+  lv_obj_set_style_opa(b, LV_OPA_40, LV_STATE_DISABLED);
+  lv_obj_align(b, align, 0, -2);
+  lv_obj_add_event_cb(b, onZoomClicked, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<intptr_t>(step)));
+  lv_obj_t* l = lv_label_create(b);
+  lv_label_set_text(l, symbol);
+  lv_obj_set_style_text_color(l, kText, 0);
+  lv_obj_center(l);
+  return b;
+}
+
 }  // namespace
 
 void init(double homeLat, double homeLon, int radiusNm) {
@@ -611,6 +781,7 @@ void init(double homeLat, double homeLon, int radiusNm) {
   s.homeLat = homeLat;
   s.homeLon = homeLon;
   s.radiusNm = radiusNm;
+  s_seen = static_cast<Seen*>(heap_caps_malloc(kSeenCap * sizeof(Seen), MALLOC_CAP_SPIRAM));
 
   lv_obj_t* screen = lv_screen_active();
   lv_obj_set_style_bg_color(screen, kBg, 0);
@@ -626,7 +797,7 @@ void init(double homeLat, double homeLon, int radiusNm) {
   lv_obj_add_event_cb(s_scope, onScopeClicked, LV_EVENT_CLICKED, nullptr);
 
   s_scopeMsg = lv_label_create(s_scope);
-  lv_obj_set_width(s_scopeMsg, kScope - 40);
+  lv_obj_set_width(s_scopeMsg, kScope - 80);  // stays inside the round window
   lv_label_set_long_mode(s_scopeMsg, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(s_scopeMsg, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(s_scopeMsg, &lv_font_montserrat_20, 0);
@@ -643,53 +814,81 @@ void init(double homeLat, double homeLon, int radiusNm) {
   lv_obj_set_style_bg_color(panel, kPanelBg, 0);
   lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
 
-  s_clock = lv_label_create(panel);
-  lv_obj_set_style_text_font(s_clock, &lv_font_montserrat_28, 0);
-  lv_obj_set_style_text_color(s_clock, kText, 0);
-  lv_label_set_text(s_clock, "--:--");
-  lv_obj_align(s_clock, LV_ALIGN_TOP_MID, 0, 4);
-
-  s_status = lv_label_create(panel);
-  lv_obj_set_width(s_status, kPanelW - 8);
-  lv_obj_set_style_text_font(s_status, &lv_font_montserrat_12, 0);
-  lv_obj_set_style_text_color(s_status, kDim, 0);
-  lv_obj_set_style_text_align(s_status, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_text(s_status, "");
-  lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 40);
-
-  constexpr int kListY = 72;
   s_list = plainBox(panel);
-  lv_obj_set_pos(s_list, 0, kListY);
-  lv_obj_set_size(s_list, kPanelW, board::kHeight - kListY);
+  lv_obj_set_pos(s_list, kInset, kInset);
+  lv_obj_set_size(s_list, kInnerW, kListH);
   lv_obj_set_style_bg_color(s_list, kPanelBg, 0);
   lv_obj_set_flex_flow(s_list, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_scrollbar_mode(s_list, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_style_pad_row(s_list, 0, 0);
+  lv_obj_set_scroll_dir(s_list, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(s_list, LV_SCROLLBAR_MODE_ACTIVE);
+  createRows();
 
   s_detail = plainBox(panel);
-  lv_obj_set_pos(s_detail, 0, kListY);
-  lv_obj_set_size(s_detail, kPanelW, board::kHeight - kListY);
+  lv_obj_set_pos(s_detail, kInset, kInset);
+  lv_obj_set_size(s_detail, kInnerW, kListH);
   lv_obj_set_style_bg_color(s_detail, kPanelBg, 0);
-  lv_obj_set_style_pad_all(s_detail, 6, 0);
+  lv_obj_set_style_pad_all(s_detail, 4, 0);
   lv_obj_remove_flag(s_detail, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(s_detail, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN));
   lv_obj_add_event_cb(s_detail, onDetailClicked, LV_EVENT_CLICKED, nullptr);
 
   s_detailTitle = lv_label_create(s_detail);
-  lv_obj_set_style_text_font(s_detailTitle, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(s_detailTitle, &lv_font_montserrat_16, 0);
   lv_obj_align(s_detailTitle, LV_ALIGN_TOP_LEFT, 0, 0);
 
   s_detailBody = lv_label_create(s_detail);
-  lv_obj_set_width(s_detailBody, kPanelW - 12);
+  lv_obj_set_width(s_detailBody, kInnerW - 8);
   lv_obj_set_style_text_font(s_detailBody, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(s_detailBody, kText, 0);
-  lv_obj_set_style_text_line_space(s_detailBody, 3, 0);
-  lv_obj_align(s_detailBody, LV_ALIGN_TOP_LEFT, 0, 30);
+  lv_obj_set_style_text_line_space(s_detailBody, 2, 0);
+  lv_obj_align(s_detailBody, LV_ALIGN_TOP_LEFT, 0, 24);
 
   lv_obj_t* hint = lv_label_create(s_detail);
   lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(hint, kDim, 0);
   lv_label_set_text(hint, "tap to go back");
   lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+  lv_obj_t* controls = plainBox(panel);
+  lv_obj_set_pos(controls, kInset, kInset + kListH);
+  lv_obj_set_size(controls, kInnerW, kControlsH);
+  lv_obj_set_style_bg_opa(controls, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_side(controls, LV_BORDER_SIDE_TOP, 0);
+  lv_obj_set_style_border_color(controls, kDivider, 0);
+  lv_obj_set_style_border_width(controls, 1, 0);
+  lv_obj_remove_flag(controls, LV_OBJ_FLAG_SCROLLABLE);
+
+  s_clock = lv_label_create(controls);
+  lv_obj_set_style_text_font(s_clock, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(s_clock, kText, 0);
+  lv_label_set_text(s_clock, "--:--");
+  lv_obj_align(s_clock, LV_ALIGN_TOP_LEFT, 2, 6);
+
+  s_status = lv_label_create(controls);
+  lv_obj_set_size(s_status, 84, 2 * lv_font_get_line_height(&lv_font_montserrat_12));
+  lv_label_set_long_mode(s_status, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_font(s_status, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(s_status, kDim, 0);
+  lv_obj_set_style_text_align(s_status, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_text(s_status, "");
+  lv_obj_align(s_status, LV_ALIGN_TOP_RIGHT, -2, 2);
+
+  s_link = lv_label_create(controls);
+  lv_obj_set_size(s_link, kInnerW - 4, 2 * lv_font_get_line_height(&lv_font_montserrat_12));
+  lv_label_set_long_mode(s_link, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_font(s_link, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(s_link, kDim, 0);
+  lv_label_set_text(s_link, "");
+  lv_obj_align(s_link, LV_ALIGN_TOP_LEFT, 2, 34);
+
+  s_zoomOut = zoomButton(controls, LV_SYMBOL_MINUS, -1, LV_ALIGN_BOTTOM_LEFT);
+  s_zoomIn = zoomButton(controls, LV_SYMBOL_PLUS, 1, LV_ALIGN_BOTTOM_RIGHT);
+  s_range = lv_label_create(controls);
+  lv_obj_set_style_text_font(s_range, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_range, kRingText, 0);
+  lv_obj_align(s_range, LV_ALIGN_BOTTOM_MID, 0, -8);
+  updateRange();
 
   lv_timer_create(tick, 250, nullptr);
 }

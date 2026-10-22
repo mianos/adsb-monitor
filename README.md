@@ -26,9 +26,11 @@ and a rectangular one over the panel:
   - red: the plane is squawking an emergency
 
   Altitudes above 18,000 ft are shown as flight levels, for example FL350.
-- **List (top right):** up to 30 aircraft, one line each with callsign, altitude
-  and distance in nm. Flying aircraft come first, nearest first, then those on
-  the ground. Swipe to scroll.
+- **List (top right):** the aircraft on the radar, up to 30, one line each with
+  callsign, altitude and distance in nm. Flying aircraft come first, nearest
+  first, then those on the ground. Zooming in shortens the list to match, and
+  the status line says how many of the flying aircraft are in view. Swipe to
+  scroll.
 - **Status (bottom right):**
   - the time, how many aircraft are in the air now, and how long ago the data
     was updated (red with STALE if the last update failed)

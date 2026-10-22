@@ -129,6 +129,8 @@ lv_color_t altColor(const Aircraft& a) {
 }
 
 float viewNm() { return s.radiusNm * kZoom[s.zoom]; }
+// Farthest an aircraft can be and still show on the radar (the edge of the window).
+float radarLimitNm() { return viewNm() * kVisibleR / kScopeR; }
 
 lv_point_precise_t pt(float x, float y) {
   return {static_cast<lv_value_precise_t>(std::lround(x)), static_cast<lv_value_precise_t>(std::lround(y))};
@@ -209,19 +211,26 @@ void drawRing(lv_layer_t* layer, float x, float y, int radius, int width, lv_col
 }
 
 // A lone parked aircraft is a small dot; a group is a grey badge with the count.
-// Returns the area it covers, so labels keep clear of it.
-lv_area_t drawCluster(lv_layer_t* layer, float x, float y, int count) {
+// The area it covers, relative to the scope centre, so labels keep clear of it.
+lv_area_t badgeArea(float x, float y, int count) {
   const int ix = std::lround(x), iy = std::lround(y);
-  if (count == 1) {
-    drawRing(layer, x, y, 2, 3, lv_color_hex(0x9a9a9a));
-    return {ix - 3, iy - 3, ix + 3, iy + 3};
-  }
+  if (count == 1) return {ix - 3, iy - 3, ix + 3, iy + 3};
   char text[8];
   snprintf(text, sizeof text, "%d", count);
   lv_point_t size;
   lv_text_get_size(&size, text, &lv_font_montserrat_12, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
   const int w = std::max<int>(size.x + 8, size.y + 2), h = size.y + 2;
-  const lv_area_t area = {ix - w / 2, iy - h / 2, ix - w / 2 + w - 1, iy - h / 2 + h - 1};
+  return {ix - w / 2, iy - h / 2, ix - w / 2 + w - 1, iy - h / 2 + h - 1};
+}
+
+void drawBadge(lv_layer_t* layer, const lv_area_t& area, int count) {
+  if (count == 1) {
+    drawRing(layer, (area.x1 + area.x2) / 2.0f, (area.y1 + area.y2) / 2.0f, 2, 3, lv_color_hex(0x9a9a9a));
+    return;
+  }
+  char text[8];
+  snprintf(text, sizeof text, "%d", count);
+  const int h = lv_area_get_height(&area);
   lv_draw_rect_dsc_t bg;
   lv_draw_rect_dsc_init(&bg);
   bg.bg_color = lv_color_hex(0x5a5a5a);
@@ -238,8 +247,134 @@ lv_area_t drawCluster(lv_layer_t* layer, float x, float y, int count) {
   lv_area_t textArea = area;
   textArea.y1 += 1;
   lv_draw_label(layer, &d, &textArea);
-  return area;
 }
+
+// Everything placed on the scope, relative to its centre. LVGL renders the scope
+// in 40-line strips and runs drawScope for each, so this is worked out once per
+// redraw (redrawScope) and each strip only draws what touches it.
+struct Segment {
+  lv_point_precise_t p0, p1;
+  lv_color_t color;
+};
+struct Badge {
+  lv_area_t area;
+  int count;
+};
+struct Marker {
+  float x, y, track;  // track in radians
+  bool arrow, ground, selected;
+  lv_color_t color;
+};
+struct Callout {
+  lv_area_t area;
+  std::string text;
+  lv_color_t color;
+};
+struct Layout {
+  bool dirty = true;
+  std::vector<Segment> trails;
+  std::vector<Badge> badges;
+  std::vector<Marker> markers;  // farthest first, so near aircraft draw on top
+  std::vector<Callout> callouts;
+} s_layout;
+
+void redrawScope() {
+  s_layout.dirty = true;
+  lv_obj_invalidate(s_scope);
+}
+
+void computeLayout() {
+  Layout& l = s_layout;
+  l.dirty = false;
+  l.trails.clear();
+  l.badges.clear();
+  l.markers.clear();
+  l.callouts.clear();
+  const float limit = radarLimitNm();
+
+  for (const Aircraft& a : s.snap->aircraft) {
+    if (a.distNm > limit || !drawnSingly(a)) continue;  // no trail without its marker
+    auto it = s.trails.find(a.hex);
+    if (it == s.trails.end()) continue;
+    const auto& pts = it->second;
+    for (size_t i = 1; i < pts.size(); ++i) {
+      float x0, y0, x1, y1;
+      toScope(pts[i - 1].eastNm, pts[i - 1].northNm, x0, y0);
+      toScope(pts[i].eastNm, pts[i].northNm, x1, y1);
+      if (std::hypot(x0, y0) > kVisibleR || std::hypot(x1, y1) > kVisibleR) continue;
+      l.trails.push_back({pt(x0, y0), pt(x1, y1), altColor(a)});
+    }
+  }
+
+  // Parked aircraft pile up at airports, so in Group mode they collapse into
+  // count badges and take no labels.
+  std::vector<Cluster> clusters;
+  if (s.ground == Ground::Group) {
+    for (const Aircraft& a : s.snap->aircraft) {
+      if (drawnSingly(a) || a.distNm > limit) continue;
+      float east, north, x, y;
+      position(a, east, north);
+      toScope(east, north, x, y);
+      auto near = std::find_if(clusters.begin(), clusters.end(),
+                               [&](const Cluster& c) { return std::hypot(c.x - x, c.y - y) < kClusterPx; });
+      if (near == clusters.end()) {
+        clusters.push_back({x, y, 1});
+      } else {
+        ++near->count;
+      }
+    }
+  }
+  std::vector<lv_area_t> taken;
+  for (const Cluster& c : clusters) {
+    l.badges.push_back({badgeArea(c.x, c.y, c.count), c.count});
+    taken.push_back(l.badges.back().area);
+  }
+
+  for (auto it = s.snap->aircraft.rbegin(); it != s.snap->aircraft.rend(); ++it) {
+    const Aircraft& a = *it;
+    if (a.distNm > limit || !drawnSingly(a)) continue;
+    float east, north, x, y;
+    position(a, east, north);
+    toScope(east, north, x, y);
+    l.markers.push_back({x, y, static_cast<float>(a.track * geo::kDeg), a.hasTrack && !a.onGround, a.onGround, a.hex == s.selected,
+                         altColor(a)});
+  }
+
+  // Callouts: the selected aircraft, then nearest first, each in the first of four
+  // spots around its marker that is clear of labels already placed. Aircraft that
+  // find no spot stay unlabelled (still tappable).
+  std::vector<const Aircraft*> order;
+  if (const Aircraft* sel = findSelected()) order.push_back(sel);
+  for (const Aircraft& a : s.snap->aircraft) {
+    if (a.hex != s.selected) order.push_back(&a);
+  }
+  char buf[48];
+  for (const Aircraft* a : order) {
+    if (a->distNm > limit || !drawnSingly(*a)) continue;
+    float east, north, x, y;
+    position(*a, east, north);
+    toScope(east, north, x, y);
+    const int px = std::lround(x), py = std::lround(y);
+    const std::string alt = altText(*a);
+    snprintf(buf, sizeof buf, alt.empty() ? "%s" : "%s\n%s", a->label().c_str(), alt.c_str());
+    lv_point_t size;
+    lv_text_get_size(&size, buf, &lv_font_montserrat_12, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    const int w = size.x + 2, h = size.y;
+    const lv_point_t spots[] = {{px + 9, py - h / 2}, {px - 9 - w, py - h / 2}, {px - w / 2, py - 10 - h},
+                                {px - w / 2, py + 10}};
+    for (const lv_point_t& sp : spots) {
+      const lv_area_t area = {sp.x, sp.y, sp.x + w - 1, sp.y + h - 1};
+      if (!inWindow(area, 0, 0) ||
+          std::any_of(taken.begin(), taken.end(), [&](const lv_area_t& t) { return overlaps(t, area); }))
+        continue;
+      l.callouts.push_back({area, buf, a->hex == s.selected ? kSelect : altColor(*a)});
+      taken.push_back(area);
+      break;
+    }
+  }
+}
+
+lv_area_t offset(const lv_area_t& a, int dx, int dy) { return {a.x1 + dx, a.y1 + dy, a.x2 + dx, a.y2 + dy}; }
 
 void drawScope(lv_event_t* e) {
   lv_layer_t* layer = lv_event_get_layer(e);
@@ -274,104 +409,57 @@ void drawScope(lv_event_t* e) {
   // Inside the outer ring, opposite its distance label, so the window's edge can't cut it.
   drawLabel(layer, "N", &lv_font_montserrat_14, kRingText, cx - 14, cy - kScopeR + 1, 20);
 
-  const float limit = viewNm() * kVisibleR / kScopeR;
+  if (s_layout.dirty) computeLayout();
+  // The strip being rendered; anything outside it would only be queued and clipped away.
+  const lv_area_t strip = offset(layer->_clip_area, -cx, -cy);
+  auto inStrip = [&](const lv_area_t& a) { return overlaps(a, strip); };
+
   lv_draw_line_dsc_t trail;
   lv_draw_line_dsc_init(&trail);
   trail.width = 1;
   trail.opa = LV_OPA_50;
-  for (const Aircraft& a : s.snap->aircraft) {
-    if (!drawnSingly(a)) continue;
-    auto it = s.trails.find(a.hex);
-    if (it == s.trails.end() || it->second.size() < 2) continue;
-    trail.color = altColor(a);
-    const auto& pts = it->second;
-    for (size_t i = 1; i < pts.size(); ++i) {
-      float x0, y0, x1, y1;
-      toScope(pts[i - 1].eastNm, pts[i - 1].northNm, x0, y0);
-      toScope(pts[i].eastNm, pts[i].northNm, x1, y1);
-      if (std::hypot(x0, y0) > kVisibleR || std::hypot(x1, y1) > kVisibleR) continue;
-      trail.p1 = pt(cx + x0, cy + y0);
-      trail.p2 = pt(cx + x1, cy + y1);
-      lv_draw_line(layer, &trail);
-    }
+  for (const Segment& seg : s_layout.trails) {
+    const lv_area_t bounds = {static_cast<int32_t>(std::min(seg.p0.x, seg.p1.x)),
+                              static_cast<int32_t>(std::min(seg.p0.y, seg.p1.y)),
+                              static_cast<int32_t>(std::max(seg.p0.x, seg.p1.x)),
+                              static_cast<int32_t>(std::max(seg.p0.y, seg.p1.y))};
+    if (!inStrip(bounds)) continue;
+    trail.color = seg.color;
+    trail.p1 = {seg.p0.x + cx, seg.p0.y + cy};
+    trail.p2 = {seg.p1.x + cx, seg.p1.y + cy};
+    lv_draw_line(layer, &trail);
   }
 
-  // Parked aircraft pile up at airports, so in Group mode they collapse into
-  // count badges and take no labels.
-  std::vector<Cluster> clusters;
-  if (s.ground == Ground::Group) {
-    for (const Aircraft& a : s.snap->aircraft) {
-      if (drawnSingly(a) || a.distNm > limit) continue;
-      float east, north, x, y;
-      position(a, east, north);
-      toScope(east, north, x, y);
-      auto near = std::find_if(clusters.begin(), clusters.end(),
-                               [&](const Cluster& c) { return std::hypot(c.x - x, c.y - y) < kClusterPx; });
-      if (near == clusters.end()) {
-        clusters.push_back({x, y, 1});
-      } else {
-        ++near->count;
-      }
-    }
+  for (const Badge& b : s_layout.badges) {
+    if (inStrip(b.area)) drawBadge(layer, offset(b.area, cx, cy), b.count);
   }
-  std::vector<lv_area_t> taken;
-  for (const Cluster& c : clusters) taken.push_back(drawCluster(layer, cx + c.x, cy + c.y, c.count));
 
   lv_draw_triangle_dsc_t tri;
   lv_draw_triangle_dsc_init(&tri);
   tri.bg_opa = LV_OPA_COVER;
-  // Farthest first so near (more relevant) aircraft draw on top.
-  for (auto it = s.snap->aircraft.rbegin(); it != s.snap->aircraft.rend(); ++it) {
-    const Aircraft& a = *it;
-    if (a.distNm > limit || !drawnSingly(a)) continue;
-    float east, north, x, y;
-    position(a, east, north);
-    toScope(east, north, x, y);
-    const float px = cx + x, py = cy + y;
-    const lv_color_t c = altColor(a);
-    if (a.hasTrack && !a.onGround) {
-      const float t = a.track * geo::kDeg;
+  for (const Marker& m : s_layout.markers) {
+    constexpr int kReach = 15;  // the selection ring is the widest part
+    const lv_area_t bounds = {static_cast<int32_t>(m.x) - kReach, static_cast<int32_t>(m.y) - kReach,
+                              static_cast<int32_t>(m.x) + kReach, static_cast<int32_t>(m.y) + kReach};
+    if (!inStrip(bounds)) continue;
+    const float px = cx + m.x, py = cy + m.y;
+    if (m.arrow) {
       auto at = [&](float ang, float len) { return pt(px + len * std::sin(ang), py - len * std::cos(ang)); };
-      tri.bg_color = c;
-      tri.p[0] = at(t, 9);
-      tri.p[1] = at(t + 2.5f, 7);
-      tri.p[2] = at(t - 2.5f, 7);
+      tri.bg_color = m.color;
+      tri.p[0] = at(m.track, 9);
+      tri.p[1] = at(m.track + 2.5f, 7);
+      tri.p[2] = at(m.track - 2.5f, 7);
       lv_draw_triangle(layer, &tri);
     } else {
-      drawRing(layer, px, py, a.onGround ? 2 : 4, a.onGround ? 3 : 4, c);
+      drawRing(layer, px, py, m.ground ? 2 : 4, m.ground ? 3 : 4, m.color);
     }
-    if (a.hex == s.selected) drawRing(layer, px, py, 13, 2, kSelect);
+    if (m.selected) drawRing(layer, px, py, 13, 2, kSelect);
   }
 
-  // Callouts: the selected aircraft, then nearest first, each in the first of four
-  // spots around its marker that is clear of labels already placed. Aircraft that
-  // find no spot stay unlabelled (still tappable).
-  std::vector<const Aircraft*> order;
-  if (const Aircraft* sel = findSelected()) order.push_back(sel);
-  for (const Aircraft& a : s.snap->aircraft) {
-    if (a.hex != s.selected) order.push_back(&a);
-  }
-  for (const Aircraft* a : order) {
-    if (a->distNm > limit || !drawnSingly(*a)) continue;
-    float east, north, x, y;
-    position(*a, east, north);
-    toScope(east, north, x, y);
-    const int px = cx + std::lround(x), py = cy + std::lround(y);
-    const std::string alt = altText(*a);
-    snprintf(buf, sizeof buf, alt.empty() ? "%s" : "%s\n%s", a->label().c_str(), alt.c_str());
-    lv_point_t size;
-    lv_text_get_size(&size, buf, &lv_font_montserrat_12, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    const int w = size.x + 2, h = size.y;
-    const lv_point_t spots[] = {{px + 9, py - h / 2}, {px - 9 - w, py - h / 2}, {px - w / 2, py - 10 - h},
-                                {px - w / 2, py + 10}};
-    for (const lv_point_t& sp : spots) {
-      const lv_area_t area = {sp.x, sp.y, sp.x + w - 1, sp.y + h - 1};
-      if (!inWindow(area, cx, cy) || std::any_of(taken.begin(), taken.end(), [&](const lv_area_t& t) { return overlaps(t, area); }))
-        continue;
-      drawLabel(layer, buf, &lv_font_montserrat_12, a->hex == s.selected ? kSelect : altColor(*a), sp.x, sp.y, w);
-      taken.push_back(area);
-      break;
-    }
+  for (const Callout& c : s_layout.callouts) {
+    if (!inStrip(c.area)) continue;
+    drawLabel(layer, c.text.c_str(), &lv_font_montserrat_12, c.color, c.area.x1 + cx, c.area.y1 + cy,
+              lv_area_get_width(&c.area));
   }
 
   // Home.
@@ -457,25 +545,27 @@ void onRowClicked(lv_event_t* e) {
   if (i >= s.rowHex.size()) return;
   s.selected = s.rowHex[i];
   refreshDetail();
-  lv_obj_invalidate(s_scope);
+  redrawScope();
 }
 
 void onDetailClicked(lv_event_t*) {
   s.selected.clear();
   refreshDetail();
-  lv_obj_invalidate(s_scope);
+  redrawScope();
 }
 
 void rebuildList() {
   s.rowHex.clear();
-  // Airborne first (nearest first, as the snapshot is sorted), then parked.
+  // What the radar shows: airborne first (nearest first, as the snapshot is
+  // sorted), then parked.
+  const float limit = radarLimitNm();
   std::vector<const Aircraft*> rows;
   for (const Aircraft& a : s.snap->aircraft) {
-    if (!a.onGround) rows.push_back(&a);
+    if (!a.onGround && a.distNm <= limit) rows.push_back(&a);
   }
   if (s.ground != Ground::Hide) {
     for (const Aircraft& a : s.snap->aircraft) {
-      if (a.onGround) rows.push_back(&a);
+      if (a.onGround && a.distNm <= limit) rows.push_back(&a);
     }
   }
   for (int i = 0; i < kMaxRows; ++i) {
@@ -542,7 +632,8 @@ void updateRange() {
 void setZoom(int zoom) {
   s.zoom = std::clamp(zoom, 0, kZoomLevels - 1);
   updateRange();
-  lv_obj_invalidate(s_scope);
+  rebuildList();
+  redrawScope();
 }
 
 void onZoomClicked(lv_event_t* e) {
@@ -606,9 +697,10 @@ void onScopeClicked(lv_event_t*) {
   } else {
     s.zoom = (s.zoom + 1) % kZoomLevels;
     updateRange();
+    rebuildList();
   }
   refreshDetail();
-  lv_obj_invalidate(s_scope);
+  redrawScope();
 }
 
 int flyingNow() {
@@ -674,7 +766,17 @@ void updateStatus() {
     snprintf(buf, sizeof buf, "Fetching");
   } else {
     const int age = static_cast<int>((now - s.snap->fetchedUs) / 1000000);
-    snprintf(buf, sizeof buf, "%d in the air\n%s%ds ago", flyingNow(), s.error.empty() ? "" : "STALE ", age);
+    // Zoomed in, the radar shows fewer than the list, so say how many of them it shows.
+    char count[40];
+    if (s.zoom == 0) {
+      snprintf(count, sizeof count, "%d in the air", flyingNow());
+    } else {
+      const float limit = radarLimitNm();
+      const auto inView = std::count_if(s.snap->aircraft.begin(), s.snap->aircraft.end(),
+                                        [limit](const Aircraft& a) { return !a.onGround && a.distNm <= limit; });
+      snprintf(count, sizeof count, "%d of %d in air", static_cast<int>(inView), flyingNow());
+    }
+    snprintf(buf, sizeof buf, "%s\n%s%ds ago", count, s.error.empty() ? "" : "STALE ", age);
   }
   lv_label_set_text(s_status, buf);
   lv_obj_set_style_text_color(s_status, s.error.empty() || s.snap->fetchedUs == 0 ? kDim : kEmergency, 0);
@@ -757,7 +859,7 @@ void tick(lv_timer_t*) {
   if (homeDirty) {
     s.trails.clear();
     updateRange();
-    lv_obj_invalidate(s_scope);
+    redrawScope();
   }
   if (groundChanged) {
     const Aircraft* sel = findSelected();
@@ -765,7 +867,7 @@ void tick(lv_timer_t*) {
     updateGroundButtons();
     rebuildList();
     refreshDetail();
-    lv_obj_invalidate(s_scope);
+    redrawScope();
   }
   s.error = feed::lastError();
   const uint32_t gen = feed::generation();
@@ -776,7 +878,7 @@ void tick(lv_timer_t*) {
     updateTrails();
     rebuildList();
     if (!s.selected.empty()) refreshDetail();
-    lv_obj_invalidate(s_scope);
+    redrawScope();
   }
   updateStatus();
   updateLink();

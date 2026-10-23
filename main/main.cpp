@@ -106,16 +106,20 @@ extern "C" void app_main(void) {
   ui::init(feedCfg.lat, feedCfg.lon, feedCfg.radiusNm);
   ui::setNet(ui::Net::Connecting, "Starting...");
   ui::setGround(ui::Ground(settings.ground));
+  ui::setZoom(settings.zoom);
 
   settings.onChange("tz", [] { applyTz(settings.tz); });
   settings.onChange("ground", [] { ui::setGround(ui::Ground(settings.ground)); });
-  // Same path as a POST to /config, so the page and the stored value follow the button.
-  ui::onGroundChosen([](ui::Ground mode) {
+  settings.onChange("zoom", [] { ui::setZoom(settings.zoom); });
+  // Same path as a POST to /config, so the page and the stored value follow the buttons.
+  static constexpr auto saveInt = [](const char* key, int value) {
     JsonWrapper change;
-    change.AddItem("ground", static_cast<int>(mode));
+    change.AddItem(key, value);
     settings.loadFromJson(change);
     settings.save();
-  });
+  };
+  ui::onGroundChosen([](ui::Ground mode) { saveInt("ground", static_cast<int>(mode)); });
+  ui::onZoomChosen([](int level) { saveInt("zoom", level); });
   settings.onChange("brightness", [] { display::setBrightness(settings.brightness); });
   auto refeed = [] {
     const feed::Config c = settings.feedConfig();

@@ -26,6 +26,7 @@ struct Settings : SettingsBase {
   std::string providers = kDefaultProviders;
   int brightness = 80;  // percent
   int ground = 1;       // parked aircraft: 0 hide, 1 group into badges, 2 show each (ui::Ground)
+  int zoom = 0;         // radar range: 0 full, 1 half, 2 quarter; follows the +/- buttons
 
   explicit Settings(NvsStorageManager& nvs) : SettingsBase(nvs) {
     field("tz", tz);
@@ -36,14 +37,15 @@ struct Settings : SettingsBase {
     field("providers", providers);
     field("brightness", brightness);
     field("ground", ground);
+    field("zoom", zoom);
     load();  // must follow every field() registration
   }
 
   // Hides SettingsBase::log, which would print the provider table and so any
   // API key in its headers.
   void log() const {
-    ESP_LOGI("settings", "tz=%s latitude=%s longitude=%s radius_nm=%d provider=%s brightness=%d ground=%d",
-             tz.c_str(), latitude.c_str(), longitude.c_str(), radiusNm, provider.c_str(), brightness, ground);
+    ESP_LOGI("settings", "tz=%s latitude=%s longitude=%s radius_nm=%d provider=%s brightness=%d ground=%d zoom=%d",
+             tz.c_str(), latitude.c_str(), longitude.c_str(), radiusNm, provider.c_str(), brightness, ground, zoom);
   }
 
   feed::Config feedConfig() const {

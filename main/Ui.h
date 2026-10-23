@@ -18,6 +18,9 @@ void setHome(double lat, double lon, int radiusNm);
 void setGround(Ground mode);
 // Called on the UI task when the settings view changes the mode, so it can be saved.
 void onGroundChosen(void (*cb)(Ground mode));
+// Zoom level 0 (full range), 1 (half) or 2 (quarter); the "zoom" setting.
+void setZoom(int level);
+void onZoomChosen(void (*cb)(int level));
 // Thread-safe; applied on the next UI tick. A non-empty message is shown across
 // the scope (provisioning, Wi-Fi reset).
 void setNet(Net net, const std::string& message);

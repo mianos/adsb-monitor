@@ -1,8 +1,10 @@
 #include "Ui.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <mutex>
@@ -39,6 +41,12 @@ constexpr int kPickRadiusPx = 22;
 constexpr float kZoom[] = {1.0f, 0.5f, 0.25f};
 constexpr int kZoomLevels = sizeof kZoom / sizeof kZoom[0];
 constexpr float kClusterPx = 18;
+// Between polls an aircraft is carried on along its track at its ground speed,
+// but not for ever if the feed goes quiet.
+constexpr float kReckonMaxS = 30;
+// A poll's correction to a shown position is spread over this long.
+constexpr int64_t kEaseUs = 2000000;
+constexpr float kEaseMaxNm = 2;  // bigger corrections just jump
 
 const lv_color_t kBg = lv_color_hex(0x000000);
 const lv_color_t kRing = lv_color_hex(0x1f4d2b);
@@ -72,6 +80,14 @@ struct State {
   uint32_t generation = 0;
   std::string selected;  // hex
   std::unordered_map<std::string, std::deque<Point>> trails;
+  // Where each aircraft was shown when its latest fix arrived, relative to that
+  // fix, so the marker eases over rather than jumps.
+  struct Ease {
+    float eastNm, northNm;
+    int64_t sinceUs;
+  };
+  std::unordered_map<std::string, Ease> ease;
+  std::unordered_map<std::string, int> labelSpot;  // last spot used, so labels don't flip about
   std::vector<std::string> rowHex;
   Net net = Net::Connecting;
   std::string message;
@@ -87,15 +103,16 @@ bool s_inHomeDirty = false;
 double s_inLat = 0, s_inLon = 0;
 int s_inRadius = 25;
 Ground s_inGround = Ground::Group;
+int s_inZoom = 0;
 void (*s_groundChosen)(Ground) = nullptr;
+void (*s_zoomChosen)(int) = nullptr;
 
 // List rows are created once and refilled, so a poll arriving mid-scroll
 // doesn't delete the row under the finger.
 struct Row {
   lv_obj_t* obj;
-  lv_obj_t* name;
-  lv_obj_t* alt;
-  lv_obj_t* dist;
+  std::string name, alt, dist;
+  lv_color_t color;
 };
 
 lv_obj_t* s_scope;
@@ -156,11 +173,21 @@ bool inWindow(const lv_area_t& a, int cx, int cy) {
   return true;
 }
 
+// Setting a label repaints it even when nothing changed, so check first.
+void setText(lv_obj_t* label, const char* text) {
+  if (strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+}
+
+void setTextColor(lv_obj_t* label, lv_color_t color) {
+  if (!lv_color_eq(lv_obj_get_style_text_color(label, 0), color)) lv_obj_set_style_text_color(label, color, 0);
+}
+
 void rangeText(char* buf, size_t len, float nm, const char* suffix) {
   snprintf(buf, len, nm < 10 ? "%.1f%s" : "%.0f%s", nm, suffix);
 }
 
 const Aircraft* findSelected();
+void renderBackground();
 
 // Screen position relative to the scope centre.
 void toScope(float eastNm, float northNm, float& x, float& y) {
@@ -174,6 +201,44 @@ void position(const Aircraft& a, float& eastNm, float& northNm) {
   northNm = a.distNm * std::cos(a.bearing * geo::kDeg);
 }
 
+// The fix carried forward to now along the track at the ground speed.
+void reckoned(const Aircraft& a, int64_t nowUs, float& eastNm, float& northNm) {
+  position(a, eastNm, northNm);
+  if (a.onGround || a.gsKt <= 0 || !a.hasTrack) return;
+  const float ageS = std::clamp((nowUs - s.snap->fetchedUs) / 1e6f, 0.0f, kReckonMaxS);
+  const float nm = a.gsKt * ageS / 3600;
+  eastNm += nm * std::sin(a.track * geo::kDeg);
+  northNm += nm * std::cos(a.track * geo::kDeg);
+}
+
+// Where the aircraft is drawn: reckoned, plus what is left of the correction the
+// latest fix made to the position shown before it.
+void shownPosition(const Aircraft& a, int64_t nowUs, float& eastNm, float& northNm) {
+  reckoned(a, nowUs, eastNm, northNm);
+  auto it = s.ease.find(a.hex);
+  if (it == s.ease.end()) return;
+  const float left = 1 - static_cast<float>(nowUs - it->second.sinceUs) / kEaseUs;
+  if (left <= 0) return;
+  eastNm += it->second.eastNm * left;
+  northNm += it->second.northNm * left;
+}
+
+// Called with the new snapshot in place and shown holding where each aircraft
+// was drawn a moment before it arrived.
+void startEasing(const std::unordered_map<std::string, Point>& shown, int64_t nowUs) {
+  std::unordered_map<std::string, State::Ease> next;
+  for (const Aircraft& a : s.snap->aircraft) {
+    auto it = shown.find(a.hex);
+    if (it == shown.end()) continue;
+    float east, north;
+    reckoned(a, nowUs, east, north);
+    const float dEast = it->second.eastNm - east, dNorth = it->second.northNm - north;
+    if (std::hypot(dEast, dNorth) > kEaseMaxNm) continue;
+    next[a.hex] = {dEast, dNorth, nowUs};
+  }
+  s.ease = std::move(next);
+}
+
 std::string altText(const Aircraft& a) {
   if (!a.hasAlt) return "";
   if (a.onGround) return "GND";
@@ -184,6 +249,12 @@ std::string altText(const Aircraft& a) {
     snprintf(buf, sizeof buf, "%d", (a.altFt + 50) / 100 * 100);
   }
   return buf;
+}
+
+// A climb or descent worth noting; level flight shows nothing.
+const char* climbSymbol(const Aircraft& a) {
+  if (a.onGround || !a.hasAlt) return "";
+  return a.vrateFpm > 300 ? " " LV_SYMBOL_UP : (a.vrateFpm < -300 ? " " LV_SYMBOL_DOWN : "");
 }
 
 void drawLabel(lv_layer_t* layer, const char* text, const lv_font_t* font, lv_color_t color, int x, int y,
@@ -249,9 +320,10 @@ void drawBadge(lv_layer_t* layer, const lv_area_t& area, int count) {
   lv_draw_label(layer, &d, &textArea);
 }
 
-// Everything placed on the scope, relative to its centre. LVGL renders the scope
-// in 40-line strips and runs drawScope for each, so this is worked out once per
-// redraw (redrawScope) and each strip only draws what touches it.
+// Everything placed on the scope, relative to its centre. It is worked out by
+// updateScope, which repaints only the parts that differ from the last layout;
+// LVGL renders those in 40-line strips and runs drawScope for each, and each
+// strip only draws what touches it.
 struct Segment {
   lv_point_precise_t p0, p1;
   lv_color_t color;
@@ -261,7 +333,8 @@ struct Badge {
   int count;
 };
 struct Marker {
-  float x, y, track;  // track in radians
+  int x, y;  // whole pixels, so sub-pixel drift between polls repaints nothing
+  float track;  // radians
   bool arrow, ground, selected;
   lv_color_t color;
 };
@@ -271,26 +344,22 @@ struct Callout {
   lv_color_t color;
 };
 struct Layout {
-  bool dirty = true;
+  float viewNm = 0;
   std::vector<Segment> trails;
   std::vector<Badge> badges;
   std::vector<Marker> markers;  // farthest first, so near aircraft draw on top
   std::vector<Callout> callouts;
 } s_layout;
 
-void redrawScope() {
-  s_layout.dirty = true;
-  lv_obj_invalidate(s_scope);
-}
-
 void computeLayout() {
   Layout& l = s_layout;
-  l.dirty = false;
+  l.viewNm = viewNm();
   l.trails.clear();
   l.badges.clear();
   l.markers.clear();
   l.callouts.clear();
   const float limit = radarLimitNm();
+  const int64_t now = esp_timer_get_time();
 
   for (const Aircraft& a : s.snap->aircraft) {
     if (a.distNm > limit || !drawnSingly(a)) continue;  // no trail without its marker
@@ -334,53 +403,176 @@ void computeLayout() {
     const Aircraft& a = *it;
     if (a.distNm > limit || !drawnSingly(a)) continue;
     float east, north, x, y;
-    position(a, east, north);
+    shownPosition(a, now, east, north);
     toScope(east, north, x, y);
-    l.markers.push_back({x, y, static_cast<float>(a.track * geo::kDeg), a.hasTrack && !a.onGround, a.onGround, a.hex == s.selected,
-                         altColor(a)});
+    if (std::hypot(x, y) > kVisibleR) continue;  // reckoned out of the window
+    l.markers.push_back({static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)),
+                         static_cast<float>(a.track * geo::kDeg), a.hasTrack && !a.onGround, a.onGround,
+                         a.hex == s.selected, altColor(a)});
   }
 
   // Callouts: the selected aircraft, then nearest first, each in the first of four
-  // spots around its marker that is clear of labels already placed. Aircraft that
-  // find no spot stay unlabelled (still tappable).
+  // spots around its marker that is clear of labels already placed, trying the
+  // spot it had last time first. Aircraft that find no spot stay unlabelled
+  // (still tappable).
   std::vector<const Aircraft*> order;
   if (const Aircraft* sel = findSelected()) order.push_back(sel);
   for (const Aircraft& a : s.snap->aircraft) {
     if (a.hex != s.selected) order.push_back(&a);
   }
+  std::unordered_map<std::string, int> spotUsed;
   char buf[48];
   for (const Aircraft* a : order) {
     if (a->distNm > limit || !drawnSingly(*a)) continue;
     float east, north, x, y;
-    position(*a, east, north);
+    shownPosition(*a, now, east, north);
     toScope(east, north, x, y);
     const int px = std::lround(x), py = std::lround(y);
-    const std::string alt = altText(*a);
-    snprintf(buf, sizeof buf, alt.empty() ? "%s" : "%s\n%s", a->label().c_str(), alt.c_str());
+    // Just the callsign; altitude is the marker's colour and is in the list.
+    snprintf(buf, sizeof buf, "%s", a->label().c_str());
     lv_point_t size;
     lv_text_get_size(&size, buf, &lv_font_montserrat_12, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
     const int w = size.x + 2, h = size.y;
     const lv_point_t spots[] = {{px + 9, py - h / 2}, {px - 9 - w, py - h / 2}, {px - w / 2, py - 10 - h},
                                 {px - w / 2, py + 10}};
-    for (const lv_point_t& sp : spots) {
+    auto last = s.labelSpot.find(a->hex);
+    const int first = last == s.labelSpot.end() ? 0 : last->second;
+    for (int n = -1; n < 4; ++n) {
+      const int i = n < 0 ? first : n;
+      if (n >= 0 && i == first) continue;
+      const lv_point_t& sp = spots[i];
       const lv_area_t area = {sp.x, sp.y, sp.x + w - 1, sp.y + h - 1};
       if (!inWindow(area, 0, 0) ||
           std::any_of(taken.begin(), taken.end(), [&](const lv_area_t& t) { return overlaps(t, area); }))
         continue;
       l.callouts.push_back({area, buf, a->hex == s.selected ? kSelect : altColor(*a)});
       taken.push_back(area);
+      spotUsed[a->hex] = i;
       break;
     }
   }
+  s.labelSpot = std::move(spotUsed);
 }
 
 lv_area_t offset(const lv_area_t& a, int dx, int dy) { return {a.x1 + dx, a.y1 + dy, a.x2 + dx, a.y2 + dy}; }
 
-void drawScope(lv_event_t* e) {
-  lv_layer_t* layer = lv_event_get_layer(e);
+// Each drawn thing as the area it covers and a hash of how it is drawn, so two
+// layouts can be compared without knowing which aircraft is which.
+struct Piece {
+  uint64_t key;
+  lv_area_t area;
+};
+
+uint64_t mix(uint64_t h, int32_t v) { return (h ^ static_cast<uint32_t>(v)) * 0x100000001b3ULL; }
+uint64_t mix(uint64_t h, const lv_area_t& a) { return mix(mix(mix(mix(h, a.x1), a.y1), a.x2), a.y2); }
+uint64_t mix(uint64_t h, lv_color_t c) { return mix(h, c.red << 16 | c.green << 8 | c.blue); }
+
+std::vector<Piece> pieces(const Layout& l) {
+  std::vector<Piece> out;
+  out.reserve(l.trails.size() + l.badges.size() + l.markers.size() + l.callouts.size());
+  for (const Segment& t : l.trails) {
+    // Anti-aliasing reaches a pixel past the end points.
+    const lv_area_t a = {static_cast<int32_t>(std::min(t.p0.x, t.p1.x)) - 1,
+                         static_cast<int32_t>(std::min(t.p0.y, t.p1.y)) - 1,
+                         static_cast<int32_t>(std::max(t.p0.x, t.p1.x)) + 1,
+                         static_cast<int32_t>(std::max(t.p0.y, t.p1.y)) + 1};
+    out.push_back({mix(mix(1, a), t.color), a});
+  }
+  for (const Badge& b : l.badges) out.push_back({mix(mix(2, b.area), b.count), b.area});
+  for (const Marker& m : l.markers) {
+    const int reach = m.selected ? 15 : 10;  // the selection ring is the widest part
+    const lv_area_t a = {m.x - reach, m.y - reach, m.x + reach, m.y + reach};
+    uint64_t h = mix(mix(mix(3, a), static_cast<int32_t>(m.track * 1000)), m.color);
+    out.push_back({mix(h, m.arrow << 2 | m.ground << 1 | m.selected), a});
+  }
+  for (const Callout& c : l.callouts) {
+    uint64_t h = mix(mix(4, c.area), c.color);
+    for (char ch : c.text) h = mix(h, ch);
+    out.push_back({h, c.area});
+  }
+  return out;
+}
+
+// LVGL keeps 32 invalid areas and falls back to the whole screen past that, so
+// the patches are merged down to a few first. Absolute coordinates.
+void invalidatePatches(std::vector<lv_area_t> patches) {
+  // Each part costs a fixed amount however small, so fewer, bigger patches win.
+  constexpr size_t kMaxPatches = 6;
+  auto size = [](const lv_area_t& a) { return (a.x2 - a.x1 + 1) * (a.y2 - a.y1 + 1); };
+  std::vector<lv_area_t> merged;
+  for (const lv_area_t& p : patches) {
+    size_t best = 0;
+    int32_t bestCost = INT32_MAX;
+    lv_area_t bestJoin{};
+    for (size_t i = 0; i < merged.size(); ++i) {
+      const lv_area_t& m = merged[i];
+      const lv_area_t join = {std::min(m.x1, p.x1), std::min(m.y1, p.y1), std::max(m.x2, p.x2), std::max(m.y2, p.y2)};
+      const int32_t cost = size(join) - size(m) - size(p);  // pixels the join adds beyond the two
+      if (cost < bestCost) {
+        bestCost = cost;
+        best = i;
+        bestJoin = join;
+      }
+    }
+    if (merged.empty() || (bestCost > 0 && merged.size() < kMaxPatches)) {
+      merged.push_back(p);
+    } else {
+      merged[best] = bestJoin;
+    }
+  }
+  for (const lv_area_t& m : merged) lv_obj_invalidate_area(s_scope, &m);
+}
+
+// Lays the scope out afresh and repaints only what differs from the last layout.
+// A range change moves everything, rings and labels included, so that repaints
+// the lot.
+std::vector<Piece> s_pieces;  // of s_layout, sorted by key
+
+void updateScope() {
+  std::vector<Piece> was = std::move(s_pieces);
+  const float wasNm = s_layout.viewNm;
+  computeLayout();
+  std::vector<Piece>& now = s_pieces;
+  now = pieces(s_layout);
+  std::sort(now.begin(), now.end(), [](const Piece& a, const Piece& b) { return a.key < b.key; });
+  if (s_layout.viewNm != wasNm) {
+    renderBackground();
+    lv_obj_invalidate(s_scope);
+    return;
+  }
   lv_area_t box;
   lv_obj_get_coords(s_scope, &box);
   const int cx = box.x1 + kScope / 2, cy = box.y1 + kScope / 2;
+  std::vector<lv_area_t> patches;
+  size_t i = 0, j = 0;
+  while (i < was.size() || j < now.size()) {
+    if (j == now.size() || (i < was.size() && was[i].key < now[j].key)) {
+      patches.push_back(offset(was[i++].area, cx, cy));
+    } else if (i == was.size() || now[j].key < was[i].key) {
+      patches.push_back(offset(now[j++].area, cx, cy));
+    } else {
+      ++i;
+      ++j;
+    }
+  }
+  if (!patches.empty()) invalidatePatches(std::move(patches));
+}
+
+// The rings, cross, labels and home mark change only with the range, and each
+// LVGL arc or label costs the same few hundred microseconds however little of
+// it a strip shows, so they are rendered once into an image that the strips
+// copy from. In PSRAM: LVGL's own pool is far too small for it.
+lv_draw_buf_t s_bgBuf;
+lv_obj_t* s_bgCanvas;
+float s_bgNm = -1;
+
+void renderBackground() {
+  if (s_bgNm == viewNm()) return;
+  s_bgNm = viewNm();
+  lv_canvas_fill_bg(s_bgCanvas, kBg, LV_OPA_COVER);
+  lv_layer_t layer;
+  lv_canvas_init_layer(s_bgCanvas, &layer);
+  const int cx = kScope / 2, cy = kScope / 2;
 
   lv_draw_arc_dsc_t ring;
   lv_draw_arc_dsc_init(&ring);
@@ -392,9 +584,9 @@ void drawScope(lv_event_t* e) {
   char buf[48];
   for (int i = 1; i <= 3; ++i) {
     ring.radius = kScopeR * i / 3;
-    lv_draw_arc(layer, &ring);
+    lv_draw_arc(&layer, &ring);
     rangeText(buf, sizeof buf, viewNm() * i / 3, "");
-    drawLabel(layer, buf, &lv_font_montserrat_12, kRingText, cx + 3, cy - ring.radius + 1, 40);
+    drawLabel(&layer, buf, &lv_font_montserrat_12, kRingText, cx + 3, cy - ring.radius + 1, 40);
   }
   lv_draw_line_dsc_t cross;
   lv_draw_line_dsc_init(&cross);
@@ -402,14 +594,27 @@ void drawScope(lv_event_t* e) {
   cross.width = 1;
   cross.p1 = {static_cast<lv_value_precise_t>(cx - kScopeR), static_cast<lv_value_precise_t>(cy)};
   cross.p2 = {static_cast<lv_value_precise_t>(cx + kScopeR), static_cast<lv_value_precise_t>(cy)};
-  lv_draw_line(layer, &cross);
+  lv_draw_line(&layer, &cross);
   cross.p1 = {static_cast<lv_value_precise_t>(cx), static_cast<lv_value_precise_t>(cy - kScopeR)};
   cross.p2 = {static_cast<lv_value_precise_t>(cx), static_cast<lv_value_precise_t>(cy + kScopeR)};
-  lv_draw_line(layer, &cross);
+  lv_draw_line(&layer, &cross);
   // Inside the outer ring, opposite its distance label, so the window's edge can't cut it.
-  drawLabel(layer, "N", &lv_font_montserrat_14, kRingText, cx - 14, cy - kScopeR + 1, 20);
+  drawLabel(&layer, "N", &lv_font_montserrat_14, kRingText, cx - 14, cy - kScopeR + 1, 20);
+  drawRing(&layer, cx, cy, 3, 2, kText);  // home
+  lv_canvas_finish_layer(s_bgCanvas, &layer);
+}
 
-  if (s_layout.dirty) computeLayout();
+void drawScope(lv_event_t* e) {
+  lv_layer_t* layer = lv_event_get_layer(e);
+  lv_area_t box;
+  lv_obj_get_coords(s_scope, &box);
+  const int cx = box.x1 + kScope / 2, cy = box.y1 + kScope / 2;
+
+  lv_draw_image_dsc_t bg;
+  lv_draw_image_dsc_init(&bg);
+  bg.src = &s_bgBuf;
+  lv_draw_image(layer, &bg, &box);
+
   // The strip being rendered; anything outside it would only be queued and clipped away.
   const lv_area_t strip = offset(layer->_clip_area, -cx, -cy);
   auto inStrip = [&](const lv_area_t& a) { return overlaps(a, strip); };
@@ -439,8 +644,7 @@ void drawScope(lv_event_t* e) {
   tri.bg_opa = LV_OPA_COVER;
   for (const Marker& m : s_layout.markers) {
     constexpr int kReach = 15;  // the selection ring is the widest part
-    const lv_area_t bounds = {static_cast<int32_t>(m.x) - kReach, static_cast<int32_t>(m.y) - kReach,
-                              static_cast<int32_t>(m.x) + kReach, static_cast<int32_t>(m.y) + kReach};
+    const lv_area_t bounds = {m.x - kReach, m.y - kReach, m.x + kReach, m.y + kReach};
     if (!inStrip(bounds)) continue;
     const float px = cx + m.x, py = cy + m.y;
     if (m.arrow) {
@@ -461,17 +665,6 @@ void drawScope(lv_event_t* e) {
     drawLabel(layer, c.text.c_str(), &lv_font_montserrat_12, c.color, c.area.x1 + cx, c.area.y1 + cy,
               lv_area_get_width(&c.area));
   }
-
-  // Home.
-  lv_draw_arc_dsc_t home;
-  lv_draw_arc_dsc_init(&home);
-  home.color = kText;
-  home.width = 2;
-  home.radius = 3;
-  home.start_angle = 0;
-  home.end_angle = 360;
-  home.center = {cx, cy};
-  lv_draw_arc(layer, &home);
 }
 
 const Aircraft* findSelected() {
@@ -515,8 +708,7 @@ void refreshDetail() {
   if (a->onGround) {
     body += "On ground\n";
   } else if (a->hasAlt) {
-    const char* arrow = a->vrateFpm > 300 ? " " LV_SYMBOL_UP : (a->vrateFpm < -300 ? " " LV_SYMBOL_DOWN : "");
-    snprintf(line, sizeof line, "%d ft%s\n", a->altFt, arrow);
+    snprintf(line, sizeof line, "%d ft%s\n", a->altFt, climbSymbol(*a));
     body += line;
     if (std::abs(a->vrateFpm) > 300) {
       snprintf(line, sizeof line, "%+d fpm\n", a->vrateFpm);
@@ -545,13 +737,13 @@ void onRowClicked(lv_event_t* e) {
   if (i >= s.rowHex.size()) return;
   s.selected = s.rowHex[i];
   refreshDetail();
-  redrawScope();
+  updateScope();
 }
 
 void onDetailClicked(lv_event_t*) {
   s.selected.clear();
   refreshDetail();
-  redrawScope();
+  updateScope();
 }
 
 void rebuildList() {
@@ -569,33 +761,68 @@ void rebuildList() {
     }
   }
   for (int i = 0; i < kMaxRows; ++i) {
-    const Row& r = s_rows[i];
+    Row& r = s_rows[i];
     if (i >= static_cast<int>(rows.size())) {
-      lv_obj_add_flag(r.obj, LV_OBJ_FLAG_HIDDEN);
+      if (!lv_obj_has_flag(r.obj, LV_OBJ_FLAG_HIDDEN)) lv_obj_add_flag(r.obj, LV_OBJ_FLAG_HIDDEN);
       continue;
     }
     const Aircraft& a = *rows[i];
-    lv_label_set_text(r.name, a.label().c_str());
-    lv_obj_set_style_text_color(r.name, altColor(a), 0);
-    lv_label_set_text(r.alt, altText(a).c_str());
+    std::string alt = altText(a) + climbSymbol(a);
     char dist[12];
     rangeText(dist, sizeof dist, a.distNm, "");
-    lv_label_set_text(r.dist, dist);
-    lv_obj_remove_flag(r.obj, LV_OBJ_FLAG_HIDDEN);
+    if (r.name != a.label() || !lv_color_eq(r.color, altColor(a)) || r.alt != alt || r.dist != dist) {
+      r.name = a.label();
+      r.color = altColor(a);
+      r.alt = std::move(alt);
+      r.dist = dist;
+      lv_obj_invalidate(r.obj);
+    }
+    if (lv_obj_has_flag(r.obj, LV_OBJ_FLAG_HIDDEN)) lv_obj_remove_flag(r.obj, LV_OBJ_FLAG_HIDDEN);
     s.rowHex.push_back(a.hex);
   }
 }
 
-lv_obj_t* rowLabel(lv_obj_t* row, const lv_font_t* font, lv_color_t color, int x, int w, lv_text_align_t align) {
-  lv_obj_t* l = lv_label_create(row);
-  lv_obj_set_size(l, w, lv_font_get_line_height(font));
-  lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-  lv_label_set_text(l, "");
-  lv_obj_set_style_text_font(l, font, 0);
-  lv_obj_set_style_text_color(l, color, 0);
-  lv_obj_set_style_text_align(l, align, 0);
-  lv_obj_align(l, LV_ALIGN_LEFT_MID, x, 0);
-  return l;
+// One field of a row, vertically centred. The name is cut to its column rather
+// than wrapped, as a second line would show under the row.
+void rowText(lv_layer_t* layer, const char* text, const lv_font_t* font, lv_color_t color, int x, int y, int w,
+             lv_text_align_t align) {
+  lv_draw_label_dsc_t d;
+  lv_draw_label_dsc_init(&d);
+  d.text = text;
+  d.font = font;
+  d.color = color;
+  d.align = align;
+  d.flag = LV_TEXT_FLAG_EXPAND;
+  std::string cut;
+  lv_point_t size;
+  lv_text_get_size(&size, text, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+  if (size.x > w) {
+    cut = text;
+    while (!cut.empty() && size.x > w) {
+      cut.pop_back();
+      lv_text_get_size(&size, cut.c_str(), font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    }
+    d.text = cut.c_str();
+  }
+  // With EXPAND the text is laid out at its own width, so align by hand.
+  const int tx = align == LV_TEXT_ALIGN_RIGHT ? x + w - size.x : x;
+  const int ty = y + (kRowH - lv_font_get_line_height(font)) / 2;
+  lv_area_t area = {tx, ty, tx + size.x, ty + lv_font_get_line_height(font)};
+  lv_draw_label(layer, &d, &area);
+}
+
+// A row draws its own three fields: each LVGL widget costs a fixed few hundred
+// microseconds per repaint, so three labels per row made the list the slowest
+// thing on the screen.
+void drawRow(lv_event_t* e) {
+  const Row& r = s_rows[reinterpret_cast<uintptr_t>(lv_event_get_user_data(e))];
+  lv_layer_t* layer = lv_event_get_layer(e);
+  lv_area_t box;
+  lv_obj_get_coords(r.obj, &box);
+  const int x = box.x1 + 3, w = kInnerW - 6;
+  rowText(layer, r.name.c_str(), &lv_font_montserrat_14, r.color, x, box.y1, 74, LV_TEXT_ALIGN_LEFT);
+  rowText(layer, r.alt.c_str(), &lv_font_montserrat_12, kText, x + 74, box.y1, 52, LV_TEXT_ALIGN_RIGHT);
+  rowText(layer, r.dist.c_str(), &lv_font_montserrat_12, kDim, x + 126, box.y1, w - 126, LV_TEXT_ALIGN_RIGHT);
 }
 
 // One line per aircraft: callsign, altitude, distance in nm. Type and the rest
@@ -605,7 +832,6 @@ void createRows() {
     lv_obj_t* row = lv_obj_create(s_list);
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), kRowH);
-    lv_obj_set_style_pad_hor(row, 3, 0);
     lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_style_border_color(row, kDivider, 0);
     lv_obj_set_style_border_width(row, 1, 0);
@@ -613,11 +839,10 @@ void createRows() {
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_STATE_PRESSED);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(row, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN));
-    lv_obj_add_event_cb(row, onRowClicked, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
-    const int w = kInnerW - 6;
-    s_rows[i] = {row, rowLabel(row, &lv_font_montserrat_14, kText, 0, 74, LV_TEXT_ALIGN_LEFT),
-                 rowLabel(row, &lv_font_montserrat_12, kText, 74, 40, LV_TEXT_ALIGN_RIGHT),
-                 rowLabel(row, &lv_font_montserrat_12, kDim, 114, w - 114, LV_TEXT_ALIGN_RIGHT)};
+    void* index = reinterpret_cast<void*>(static_cast<uintptr_t>(i));
+    lv_obj_add_event_cb(row, onRowClicked, LV_EVENT_CLICKED, index);
+    lv_obj_add_event_cb(row, drawRow, LV_EVENT_DRAW_MAIN, index);
+    s_rows[i].obj = row;
   }
 }
 
@@ -629,15 +854,21 @@ void updateRange() {
   lv_obj_set_state(s_zoomIn, LV_STATE_DISABLED, s.zoom == kZoomLevels - 1);
 }
 
-void setZoom(int zoom) {
+void applyZoom(int zoom) {
   s.zoom = std::clamp(zoom, 0, kZoomLevels - 1);
   updateRange();
   rebuildList();
-  redrawScope();
+  updateScope();
+}
+
+// A zoom the user picked, as opposed to one restored from settings.
+void chooseZoom(int zoom) {
+  applyZoom(zoom);
+  if (s_zoomChosen) s_zoomChosen(s.zoom);
 }
 
 void onZoomClicked(lv_event_t* e) {
-  setZoom(s.zoom + static_cast<int>(reinterpret_cast<intptr_t>(lv_event_get_user_data(e))));
+  chooseZoom(s.zoom + static_cast<int>(reinterpret_cast<intptr_t>(lv_event_get_user_data(e))));
 }
 
 void updateGroundButtons() {
@@ -679,11 +910,12 @@ void onScopeClicked(lv_event_t*) {
   const float tx = pt.x - (box.x1 + kScope / 2), ty = pt.y - (box.y1 + kScope / 2);
   const Aircraft* best = nullptr;
   float bestD = kPickRadiusPx;
+  const int64_t now = esp_timer_get_time();
   for (const Aircraft& a : s.snap->aircraft) {
     // A tap on a ground badge falls through to zoom, which splits the crowd.
     if (!drawnSingly(a)) continue;
     float east, north, x, y;
-    position(a, east, north);
+    shownPosition(a, now, east, north);
     toScope(east, north, x, y);
     const float d = std::hypot(x - tx, y - ty);
     if (d < bestD) {
@@ -695,12 +927,10 @@ void onScopeClicked(lv_event_t*) {
     s.selected = best->hex;
     s.configOpen = false;
   } else {
-    s.zoom = (s.zoom + 1) % kZoomLevels;
-    updateRange();
-    rebuildList();
+    chooseZoom((s.zoom + 1) % kZoomLevels);
   }
   refreshDetail();
-  redrawScope();
+  updateScope();
 }
 
 int flyingNow() {
@@ -778,8 +1008,8 @@ void updateStatus() {
     }
     snprintf(buf, sizeof buf, "%s\n%s%ds ago", count, s.error.empty() ? "" : "STALE ", age);
   }
-  lv_label_set_text(s_status, buf);
-  lv_obj_set_style_text_color(s_status, s.error.empty() || s.snap->fetchedUs == 0 ? kDim : kEmergency, 0);
+  setText(s_status, buf);
+  setTextColor(s_status, s.error.empty() || s.snap->fetchedUs == 0 ? kDim : kEmergency);
 }
 
 // Provider, request time, HTTP status if not 200 and any rate-limit headers the
@@ -833,7 +1063,7 @@ void updateClock() {
 }
 
 void tick(lv_timer_t*) {
-  bool homeDirty, groundChanged;
+  bool homeDirty, groundChanged, zoomChanged;
   {
     std::lock_guard<std::mutex> g(s_inMutex);
     s.net = s_inNet;
@@ -855,11 +1085,13 @@ void tick(lv_timer_t*) {
     }
     groundChanged = s.ground != s_inGround;
     s.ground = s_inGround;
+    zoomChanged = s.zoom != s_inZoom;
+    if (zoomChanged) s.zoom = s_inZoom;
   }
+  if (zoomChanged) applyZoom(s.zoom);
   if (homeDirty) {
     s.trails.clear();
     updateRange();
-    redrawScope();
   }
   if (groundChanged) {
     const Aircraft* sel = findSelected();
@@ -867,19 +1099,26 @@ void tick(lv_timer_t*) {
     updateGroundButtons();
     rebuildList();
     refreshDetail();
-    redrawScope();
   }
   s.error = feed::lastError();
   const uint32_t gen = feed::generation();
+  const int64_t now = esp_timer_get_time();
   if (gen != s.generation) {
     s.generation = gen;
+    std::unordered_map<std::string, Point> shown;
+    for (const Aircraft& a : s.snap->aircraft) {
+      if (a.onGround) continue;
+      Point& p = shown[a.hex];
+      shownPosition(a, now, p.eastNm, p.northNm);
+    }
     s.snap = feed::latest();
+    startEasing(shown, now);
     recordSeen();
     updateTrails();
     rebuildList();
     if (!s.selected.empty()) refreshDetail();
-    redrawScope();
   }
+  updateScope();  // every tick, as aircraft are carried on between polls
   updateStatus();
   updateLink();
   updateClock();
@@ -936,6 +1175,15 @@ void init(double homeLat, double homeLon, int radiusNm) {
   lv_obj_add_flag(s_scope, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(s_scope, drawScope, LV_EVENT_DRAW_MAIN, nullptr);
   lv_obj_add_event_cb(s_scope, onScopeClicked, LV_EVENT_CLICKED, nullptr);
+
+  void* bgPixels = heap_caps_malloc(kScope * kScope * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+  assert(bgPixels);
+  lv_draw_buf_init(&s_bgBuf, kScope, kScope, LV_COLOR_FORMAT_RGB565, kScope * sizeof(uint16_t), bgPixels,
+                   kScope * kScope * sizeof(uint16_t));
+  s_bgCanvas = lv_canvas_create(screen);
+  lv_canvas_set_draw_buf(s_bgCanvas, &s_bgBuf);
+  lv_obj_add_flag(s_bgCanvas, LV_OBJ_FLAG_HIDDEN);  // only ever drawn into
+  renderBackground();
 
   s_scopeMsg = lv_label_create(s_scope);
   lv_obj_set_width(s_scopeMsg, kScope - 80);  // stays inside the round window
@@ -1083,6 +1331,13 @@ void setGround(Ground mode) {
 }
 
 void onGroundChosen(void (*cb)(Ground mode)) { s_groundChosen = cb; }
+
+void setZoom(int level) {
+  std::lock_guard<std::mutex> g(s_inMutex);
+  s_inZoom = std::clamp(level, 0, kZoomLevels - 1);
+}
+
+void onZoomChosen(void (*cb)(int level)) { s_zoomChosen = cb; }
 
 void setNet(Net net, const std::string& message) {
   std::lock_guard<std::mutex> g(s_inMutex);

@@ -44,3 +44,6 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 # OTA receive and image verification run inline on the HTTP server task.
 CONFIG_WEBSERVER_TASK_STACK_SIZE=8192
+
+# Radii of the marker rings, selection ring and badges, so none is recomputed per draw.
+CONFIG_LV_DRAW_SW_CIRCLE_CACHE_SIZE=8

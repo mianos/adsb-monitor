@@ -107,10 +107,14 @@ extern "C" void app_main(void) {
   ui::setNet(ui::Net::Connecting, "Starting...");
   ui::setGround(ui::Ground(settings.ground));
   ui::setZoom(settings.zoom);
+  ui::setSweep(settings.sweep != 0);
+  ui::setUnits(settings.units == 1);
 
   settings.onChange("tz", [] { applyTz(settings.tz); });
   settings.onChange("ground", [] { ui::setGround(ui::Ground(settings.ground)); });
   settings.onChange("zoom", [] { ui::setZoom(settings.zoom); });
+  settings.onChange("sweep", [] { ui::setSweep(settings.sweep != 0); });
+  settings.onChange("units", [] { ui::setUnits(settings.units == 1); });
   // Same path as a POST to /config, so the page and the stored value follow the buttons.
   static constexpr auto saveInt = [](const char* key, int value) {
     JsonWrapper change;
@@ -120,6 +124,8 @@ extern "C" void app_main(void) {
   };
   ui::onGroundChosen([](ui::Ground mode) { saveInt("ground", static_cast<int>(mode)); });
   ui::onZoomChosen([](int level) { saveInt("zoom", level); });
+  ui::onSweepChosen([](bool on) { saveInt("sweep", on ? 1 : 0); });
+  ui::onUnitsChosen([](bool metric) { saveInt("units", metric ? 1 : 0); });
   settings.onChange("brightness", [] { display::setBrightness(settings.brightness); });
   auto refeed = [] {
     const feed::Config c = settings.feedConfig();

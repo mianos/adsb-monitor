@@ -47,6 +47,14 @@ constexpr float kReckonMaxS = 30;
 // A poll's correction to a shown position is spread over this long.
 constexpr int64_t kEaseUs = 2000000;
 constexpr float kEaseMaxNm = 2;  // bigger corrections just jump
+// The sweep is decoration only: positions come from the feed, not the beam.
+constexpr int64_t kSweepPeriodUs = 4000000;
+constexpr uint32_t kSweepFrameMs = 66;
+// A real fading wedge means blending a large area every frame, so the
+// afterglow is a few fainter lines trailing the beam instead.
+constexpr lv_opa_t kSweepOpa[] = {LV_OPA_50, LV_OPA_30, LV_OPA_20, LV_OPA_10};
+constexpr float kSweepGap = 3 * 3.14159265f / 180;
+constexpr float kSweepTrail = kSweepGap * (sizeof kSweepOpa - 1);
 
 const lv_color_t kBg = lv_color_hex(0x000000);
 const lv_color_t kRing = lv_color_hex(0x1f4d2b);
@@ -59,6 +67,8 @@ const lv_color_t kButton = lv_color_hex(0x263038);
 const lv_color_t kButtonPressed = lv_color_hex(0x3a4a56);
 const lv_color_t kSelect = lv_color_hex(0xffffff);
 const lv_color_t kEmergency = lv_color_hex(0xff3030);
+const lv_color_t kSweep = kRingText;
+const lv_font_t* const kRadarFont = &lv_font_montserrat_10;
 
 struct Point {
   float eastNm, northNm;
@@ -76,6 +86,7 @@ struct State {
   Ground ground = Ground::Group;
   bool configOpen = false;
   int zoom = 0;
+  bool metric = false;
   std::shared_ptr<const Snapshot> snap = std::make_shared<Snapshot>();
   uint32_t generation = 0;
   std::string selected;  // hex
@@ -88,6 +99,8 @@ struct State {
   };
   std::unordered_map<std::string, Ease> ease;
   std::unordered_map<std::string, int> labelSpot;  // last spot used, so labels don't flip about
+  // With the sweep on, each aircraft stays where the beam last painted it, as on a real scope.
+  std::unordered_map<std::string, Point> painted;
   std::vector<std::string> rowHex;
   Net net = Net::Connecting;
   std::string message;
@@ -104,8 +117,15 @@ double s_inLat = 0, s_inLon = 0;
 int s_inRadius = 25;
 Ground s_inGround = Ground::Group;
 int s_inZoom = 0;
+bool s_inSweep = true;
+bool s_inMetric = false;
+void (*s_unitsChosen)(bool) = nullptr;
 void (*s_groundChosen)(Ground) = nullptr;
 void (*s_zoomChosen)(int) = nullptr;
+void (*s_sweepChosen)(bool) = nullptr;
+
+bool s_sweepOn = false;
+float s_sweepAngle = 0;  // of the beam, radians clockwise from north; what drawScope draws
 
 // List rows are created once and refilled, so a poll arriving mid-scroll
 // doesn't delete the row under the finger.
@@ -128,6 +148,8 @@ lv_obj_t* s_config;
 constexpr Ground kGroundModes[] = {Ground::Group, Ground::Show, Ground::Hide};
 constexpr const char* kGroundNames[] = {"Group", "Show each", "Hide"};
 lv_obj_t* s_groundOpts[3];
+lv_obj_t* s_sweepBtn;
+lv_obj_t* s_metricBtn;
 lv_obj_t* s_list;
 Row s_rows[kMaxRows];
 lv_obj_t* s_detail;
@@ -182,8 +204,13 @@ void setTextColor(lv_obj_t* label, lv_color_t color) {
   if (!lv_color_eq(lv_obj_get_style_text_color(label, 0), color)) lv_obj_set_style_text_color(label, color, 0);
 }
 
+// Distances are kept in nm, as the feed and the radius setting use them.
+float distOut(float nm) { return s.metric ? nm * 1.852f : nm; }
+const char* distUnit() { return s.metric ? " km" : " nm"; }
+
 void rangeText(char* buf, size_t len, float nm, const char* suffix) {
-  snprintf(buf, len, nm < 10 ? "%.1f%s" : "%.0f%s", nm, suffix);
+  const float d = distOut(nm);
+  snprintf(buf, len, d < 10 ? "%.1f%s" : "%.0f%s", d, suffix);
 }
 
 const Aircraft* findSelected();
@@ -223,6 +250,21 @@ void shownPosition(const Aircraft& a, int64_t nowUs, float& eastNm, float& north
   northNm += it->second.northNm * left;
 }
 
+// False for an aircraft the sweep hasn't reached yet.
+bool drawnPosition(const Aircraft& a, int64_t nowUs, float& eastNm, float& northNm) {
+  if (s_sweepOn) {
+    auto it = s.painted.find(a.hex);
+    if (it == s.painted.end()) return false;
+    eastNm = it->second.eastNm;
+    northNm = it->second.northNm;
+    return true;
+  }
+  shownPosition(a, nowUs, eastNm, northNm);
+  return true;
+}
+
+bool unpainted(const Aircraft& a) { return s_sweepOn && !s.painted.count(a.hex); }
+
 // Called with the new snapshot in place and shown holding where each aircraft
 // was drawn a moment before it arrived.
 void startEasing(const std::unordered_map<std::string, Point>& shown, int64_t nowUs) {
@@ -243,7 +285,9 @@ std::string altText(const Aircraft& a) {
   if (!a.hasAlt) return "";
   if (a.onGround) return "GND";
   char buf[12];
-  if (a.altFt >= 18000) {
+  if (s.metric) {
+    snprintf(buf, sizeof buf, "%ld", std::lround(a.altFt * 0.3048f / 10) * 10);
+  } else if (a.altFt >= 18000) {
     snprintf(buf, sizeof buf, "FL%03d", (a.altFt + 50) / 100);
   } else {
     snprintf(buf, sizeof buf, "%d", (a.altFt + 50) / 100 * 100);
@@ -289,7 +333,7 @@ lv_area_t badgeArea(float x, float y, int count) {
   char text[8];
   snprintf(text, sizeof text, "%d", count);
   lv_point_t size;
-  lv_text_get_size(&size, text, &lv_font_montserrat_12, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+  lv_text_get_size(&size, text, kRadarFont, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
   const int w = std::max<int>(size.x + 8, size.y + 2), h = size.y + 2;
   return {ix - w / 2, iy - h / 2, ix - w / 2 + w - 1, iy - h / 2 + h - 1};
 }
@@ -312,7 +356,7 @@ void drawBadge(lv_layer_t* layer, const lv_area_t& area, int count) {
   lv_draw_label_dsc_init(&d);
   d.text = text;
   d.text_local = 1;
-  d.font = &lv_font_montserrat_12;
+  d.font = kRadarFont;
   d.color = lv_color_hex(0xf0f0f0);
   d.align = LV_TEXT_ALIGN_CENTER;
   lv_area_t textArea = area;
@@ -335,7 +379,7 @@ struct Badge {
 struct Marker {
   int x, y;  // whole pixels, so sub-pixel drift between polls repaints nothing
   float track;  // radians
-  bool arrow, ground, selected;
+  bool arrow, ground, selected, heli;
   lv_color_t color;
 };
 struct Callout {
@@ -362,7 +406,7 @@ void computeLayout() {
   const int64_t now = esp_timer_get_time();
 
   for (const Aircraft& a : s.snap->aircraft) {
-    if (a.distNm > limit || !drawnSingly(a)) continue;  // no trail without its marker
+    if (a.distNm > limit || !drawnSingly(a) || unpainted(a)) continue;  // no trail without its marker
     auto it = s.trails.find(a.hex);
     if (it == s.trails.end()) continue;
     const auto& pts = it->second;
@@ -403,12 +447,12 @@ void computeLayout() {
     const Aircraft& a = *it;
     if (a.distNm > limit || !drawnSingly(a)) continue;
     float east, north, x, y;
-    shownPosition(a, now, east, north);
+    if (!drawnPosition(a, now, east, north)) continue;
     toScope(east, north, x, y);
     if (std::hypot(x, y) > kVisibleR) continue;  // reckoned out of the window
     l.markers.push_back({static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)),
                          static_cast<float>(a.track * geo::kDeg), a.hasTrack && !a.onGround, a.onGround,
-                         a.hex == s.selected, altColor(a)});
+                         a.hex == s.selected, a.rotorcraft && !a.onGround, altColor(a)});
   }
 
   // Callouts: the selected aircraft, then nearest first, each in the first of four
@@ -425,13 +469,13 @@ void computeLayout() {
   for (const Aircraft* a : order) {
     if (a->distNm > limit || !drawnSingly(*a)) continue;
     float east, north, x, y;
-    shownPosition(*a, now, east, north);
+    if (!drawnPosition(*a, now, east, north)) continue;
     toScope(east, north, x, y);
     const int px = std::lround(x), py = std::lround(y);
     // Just the callsign; altitude is the marker's colour and is in the list.
     snprintf(buf, sizeof buf, "%s", a->label().c_str());
     lv_point_t size;
-    lv_text_get_size(&size, buf, &lv_font_montserrat_12, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    lv_text_get_size(&size, buf, kRadarFont, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
     const int w = size.x + 2, h = size.y;
     const lv_point_t spots[] = {{px + 9, py - h / 2}, {px - 9 - w, py - h / 2}, {px - w / 2, py - 10 - h},
                                 {px - w / 2, py + 10}};
@@ -483,7 +527,7 @@ std::vector<Piece> pieces(const Layout& l) {
     const int reach = m.selected ? 15 : 10;  // the selection ring is the widest part
     const lv_area_t a = {m.x - reach, m.y - reach, m.x + reach, m.y + reach};
     uint64_t h = mix(mix(mix(3, a), static_cast<int32_t>(m.track * 1000)), m.color);
-    out.push_back({mix(h, m.arrow << 2 | m.ground << 1 | m.selected), a});
+    out.push_back({mix(h, m.heli << 3 | m.arrow << 2 | m.ground << 1 | m.selected), a});
   }
   for (const Callout& c : l.callouts) {
     uint64_t h = mix(mix(4, c.area), c.color);
@@ -586,7 +630,7 @@ void renderBackground() {
     ring.radius = kScopeR * i / 3;
     lv_draw_arc(&layer, &ring);
     rangeText(buf, sizeof buf, viewNm() * i / 3, "");
-    drawLabel(&layer, buf, &lv_font_montserrat_12, kRingText, cx + 3, cy - ring.radius + 1, 40);
+    drawLabel(&layer, buf, kRadarFont, kRingText, cx + 3, cy - ring.radius + 1, 40);
   }
   lv_draw_line_dsc_t cross;
   lv_draw_line_dsc_init(&cross);
@@ -599,7 +643,7 @@ void renderBackground() {
   cross.p2 = {static_cast<lv_value_precise_t>(cx), static_cast<lv_value_precise_t>(cy + kScopeR)};
   lv_draw_line(&layer, &cross);
   // Inside the outer ring, opposite its distance label, so the window's edge can't cut it.
-  drawLabel(&layer, "N", &lv_font_montserrat_14, kRingText, cx - 14, cy - kScopeR + 1, 20);
+  drawLabel(&layer, "N", &lv_font_montserrat_12, kRingText, cx - 14, cy - kScopeR + 1, 20);
   drawRing(&layer, cx, cy, 3, 2, kText);  // home
   lv_canvas_finish_layer(s_bgCanvas, &layer);
 }
@@ -618,6 +662,24 @@ void drawScope(lv_event_t* e) {
   // The strip being rendered; anything outside it would only be queued and clipped away.
   const lv_area_t strip = offset(layer->_clip_area, -cx, -cy);
   auto inStrip = [&](const lv_area_t& a) { return overlaps(a, strip); };
+
+  if (s_sweepOn) {
+    lv_draw_line_dsc_t beam;
+    lv_draw_line_dsc_init(&beam);
+    beam.color = kSweep;
+    beam.width = 2;
+    beam.p1 = {static_cast<lv_value_precise_t>(cx), static_cast<lv_value_precise_t>(cy)};
+    for (size_t i = 0; i < sizeof kSweepOpa; ++i) {
+      const float ang = s_sweepAngle - i * kSweepGap;
+      const float x = kScopeR * std::sin(ang), y = -kScopeR * std::cos(ang);
+      const lv_area_t bounds = {static_cast<int32_t>(std::min(0.0f, x)) - 2, static_cast<int32_t>(std::min(0.0f, y)) - 2,
+                                static_cast<int32_t>(std::max(0.0f, x)) + 2, static_cast<int32_t>(std::max(0.0f, y)) + 2};
+      if (!inStrip(bounds)) continue;
+      beam.opa = kSweepOpa[i];
+      beam.p2 = pt(cx + x, cy + y);
+      lv_draw_line(layer, &beam);
+    }
+  }
 
   lv_draw_line_dsc_t trail;
   lv_draw_line_dsc_init(&trail);
@@ -647,13 +709,37 @@ void drawScope(lv_event_t* e) {
     const lv_area_t bounds = {m.x - kReach, m.y - kReach, m.x + kReach, m.y + kReach};
     if (!inStrip(bounds)) continue;
     const float px = cx + m.x, py = cy + m.y;
-    if (m.arrow) {
-      auto at = [&](float ang, float len) { return pt(px + len * std::sin(ang), py - len * std::cos(ang)); };
+    // Icon coordinates: x to the right of the nose, y forward along the track.
+    const float heading = m.arrow ? m.track : 0;
+    const float c = std::cos(heading), sn = std::sin(heading);
+    auto at = [&](float x, float y) { return pt(px + x * c + y * sn, py + x * sn - y * c); };
+    if (m.heli) {
+      drawRing(layer, px, py, 2, 3, m.color);
+      lv_draw_line_dsc_t l;
+      lv_draw_line_dsc_init(&l);
+      l.color = m.color;
+      l.width = 2;
+      l.p1 = at(0, 0);
+      l.p2 = at(0, -8);  // tail boom
+      lv_draw_line(layer, &l);
+      l.width = 1;
+      l.p1 = at(-5, 5);  // rotor
+      l.p2 = at(5, -5);
+      lv_draw_line(layer, &l);
+      l.p1 = at(5, 5);
+      l.p2 = at(-5, -5);
+      lv_draw_line(layer, &l);
+    } else if (m.arrow) {
       tri.bg_color = m.color;
-      tri.p[0] = at(m.track, 9);
-      tri.p[1] = at(m.track + 2.5f, 7);
-      tri.p[2] = at(m.track - 2.5f, 7);
-      lv_draw_triangle(layer, &tri);
+      constexpr float kPlane[][3][2] = {
+          {{0, 9}, {-1.5f, -6}, {1.5f, -6}},   // fuselage
+          {{0, 3}, {-8, -2}, {8, -2}},         // wings
+          {{0, -3}, {-3.5f, -7}, {3.5f, -7}},  // tail
+      };
+      for (const auto& t : kPlane) {
+        for (int k = 0; k < 3; ++k) tri.p[k] = at(t[k][0], t[k][1]);
+        lv_draw_triangle(layer, &tri);
+      }
     } else {
       drawRing(layer, px, py, m.ground ? 2 : 4, m.ground ? 3 : 4, m.color);
     }
@@ -662,9 +748,80 @@ void drawScope(lv_event_t* e) {
 
   for (const Callout& c : s_layout.callouts) {
     if (!inStrip(c.area)) continue;
-    drawLabel(layer, c.text.c_str(), &lv_font_montserrat_12, c.color, c.area.x1 + cx, c.area.y1 + cy,
+    drawLabel(layer, c.text.c_str(), kRadarFont, c.color, c.area.x1 + cx, c.area.y1 + cy,
               lv_area_get_width(&c.area));
   }
+}
+
+// Marks the wedge between two angles as changed, in a few pieces along the
+// radius: one box around a diagonal line would cover a whole quarter of the scope.
+void invalidateWedge(float from, float to) {
+  constexpr int kPieces = 5;
+  constexpr float kStep = 5 * 3.14159265f / 180;
+  lv_area_t box;
+  lv_obj_get_coords(s_scope, &box);
+  const int cx = box.x1 + kScope / 2, cy = box.y1 + kScope / 2;
+  for (int k = 0; k < kPieces; ++k) {
+    float x1 = 1e9f, y1 = 1e9f, x2 = -1e9f, y2 = -1e9f;
+    for (int r : {kScopeR * k / kPieces, kScopeR * (k + 1) / kPieces}) {
+      for (float ang = from;; ang = std::min(ang + kStep, to)) {
+        const float x = r * std::sin(ang), y = -r * std::cos(ang);
+        x1 = std::min(x1, x), y1 = std::min(y1, y), x2 = std::max(x2, x), y2 = std::max(y2, y);
+        if (ang >= to) break;
+      }
+    }
+    const lv_area_t a = {cx + static_cast<int32_t>(std::floor(x1)) - 2, cy + static_cast<int32_t>(std::floor(y1)) - 2,
+                         cx + static_cast<int32_t>(std::ceil(x2)) + 2, cy + static_cast<int32_t>(std::ceil(y2)) + 2};
+    lv_obj_invalidate_area(s_scope, &a);
+  }
+}
+
+void sweepTick(lv_timer_t*) {
+  constexpr float kTwoPi = 2 * 3.14159265f;
+  if (!s_sweepOn) return;
+  const float was = s_sweepAngle;
+  s_sweepAngle = kTwoPi * (esp_timer_get_time() % kSweepPeriodUs) / kSweepPeriodUs;
+  float moved = s_sweepAngle - was;
+  if (moved < 0) moved += kTwoPi;
+  // After a long stall the wedge is most of the circle; just repaint it all.
+  const bool stalled = moved > kTwoPi / 8;
+  if (stalled) {
+    lv_obj_invalidate(s_scope);
+  } else {
+    invalidateWedge(was - kSweepTrail, was + moved);
+  }
+
+  const int64_t now = esp_timer_get_time();
+  bool repaint = false;
+  for (const Aircraft& a : s.snap->aircraft) {
+    Point p;
+    shownPosition(a, now, p.eastNm, p.northNm);
+    float behind = std::fmod(s_sweepAngle - std::atan2(p.eastNm, p.northNm) + 2 * kTwoPi, kTwoPi);
+    if (!stalled && behind >= moved) continue;
+    s.painted[a.hex] = p;
+    repaint = true;
+  }
+  if (repaint) updateScope();
+}
+
+void applySweep(bool on) {
+  if (on == s_sweepOn) return;
+  if (s_sweepOn) invalidateWedge(s_sweepAngle - kSweepTrail, s_sweepAngle);
+  s_sweepOn = on;
+  // Switching it on shouldn't blank the scope until the beam comes round.
+  s.painted.clear();
+  const int64_t now = esp_timer_get_time();
+  for (const Aircraft& a : s.snap->aircraft) {
+    Point& p = s.painted[a.hex];
+    shownPosition(a, now, p.eastNm, p.northNm);
+  }
+  lv_obj_set_state(s_sweepBtn, LV_STATE_CHECKED, on);
+}
+
+void onSweepClicked(lv_event_t*) {
+  const bool on = !s_sweepOn;
+  setSweep(on);
+  if (s_sweepChosen) s_sweepChosen(on);
 }
 
 const Aircraft* findSelected() {
@@ -708,15 +865,23 @@ void refreshDetail() {
   if (a->onGround) {
     body += "On ground\n";
   } else if (a->hasAlt) {
-    snprintf(line, sizeof line, "%d ft%s\n", a->altFt, climbSymbol(*a));
+    if (s.metric) {
+      snprintf(line, sizeof line, "%ld m%s\n", std::lround(a->altFt * 0.3048f), climbSymbol(*a));
+    } else {
+      snprintf(line, sizeof line, "%d ft%s\n", a->altFt, climbSymbol(*a));
+    }
     body += line;
     if (std::abs(a->vrateFpm) > 300) {
-      snprintf(line, sizeof line, "%+d fpm\n", a->vrateFpm);
+      if (s.metric) {
+        snprintf(line, sizeof line, "%+.1f m/s\n", a->vrateFpm * 0.00508f);
+      } else {
+        snprintf(line, sizeof line, "%+d fpm\n", a->vrateFpm);
+      }
       body += line;
     }
   }
   if (a->gsKt >= 0) {
-    snprintf(line, sizeof line, "%.0f kt", a->gsKt);
+    snprintf(line, sizeof line, s.metric ? "%.0f km/h" : "%.0f kt", s.metric ? a->gsKt * 1.852f : a->gsKt);
     body += line;
     if (a->hasTrack) {
       snprintf(line, sizeof line, "  trk %03.0f", a->track);
@@ -724,7 +889,7 @@ void refreshDetail() {
     }
     body += "\n";
   }
-  snprintf(line, sizeof line, "%.1f nm  brg %03.0f\n", a->distNm, a->bearing);
+  snprintf(line, sizeof line, "%.1f%s  brg %03.0f\n", distOut(a->distNm), distUnit(), a->bearing);
   body += line;
   if (!a->squawk.empty()) body += "Squawk " + a->squawk + "\n";
   if (a->emergency) body += "EMERGENCY\n";
@@ -848,7 +1013,7 @@ void createRows() {
 
 void updateRange() {
   char buf[16];
-  rangeText(buf, sizeof buf, viewNm(), " nm");
+  rangeText(buf, sizeof buf, viewNm(), distUnit());
   lv_label_set_text(s_range, buf);
   lv_obj_set_state(s_zoomOut, LV_STATE_DISABLED, s.zoom == 0);
   lv_obj_set_state(s_zoomIn, LV_STATE_DISABLED, s.zoom == kZoomLevels - 1);
@@ -859,6 +1024,24 @@ void applyZoom(int zoom) {
   updateRange();
   rebuildList();
   updateScope();
+}
+
+void applyUnits(bool metric) {
+  if (metric == s.metric) return;
+  s.metric = metric;
+  lv_obj_set_state(s_metricBtn, LV_STATE_CHECKED, metric);
+  updateRange();
+  rebuildList();
+  if (!s.selected.empty()) refreshDetail();
+  s_bgNm = -1;  // the ring labels
+  renderBackground();
+  lv_obj_invalidate(s_scope);
+}
+
+void onMetricClicked(lv_event_t*) {
+  const bool metric = !s.metric;
+  setUnits(metric);
+  if (s_unitsChosen) s_unitsChosen(metric);
 }
 
 // A zoom the user picked, as opposed to one restored from settings.
@@ -915,7 +1098,7 @@ void onScopeClicked(lv_event_t*) {
     // A tap on a ground badge falls through to zoom, which splits the crowd.
     if (!drawnSingly(a)) continue;
     float east, north, x, y;
-    shownPosition(a, now, east, north);
+    if (!drawnPosition(a, now, east, north)) continue;
     toScope(east, north, x, y);
     const float d = std::hypot(x - tx, y - ty);
     if (d < bestD) {
@@ -1063,7 +1246,7 @@ void updateClock() {
 }
 
 void tick(lv_timer_t*) {
-  bool homeDirty, groundChanged, zoomChanged;
+  bool homeDirty, groundChanged, zoomChanged, sweep, metric;
   {
     std::lock_guard<std::mutex> g(s_inMutex);
     s.net = s_inNet;
@@ -1087,7 +1270,11 @@ void tick(lv_timer_t*) {
     s.ground = s_inGround;
     zoomChanged = s.zoom != s_inZoom;
     if (zoomChanged) s.zoom = s_inZoom;
+    sweep = s_inSweep;
+    metric = s_inMetric;
   }
+  applySweep(sweep);
+  applyUnits(metric);
   if (zoomChanged) applyZoom(s.zoom);
   if (homeDirty) {
     s.trails.clear();
@@ -1113,6 +1300,12 @@ void tick(lv_timer_t*) {
     }
     s.snap = feed::latest();
     startEasing(shown, now);
+    std::unordered_map<std::string, Point> painted;
+    for (const Aircraft& a : s.snap->aircraft) {
+      auto it = s.painted.find(a.hex);
+      if (it != s.painted.end()) painted.emplace(a.hex, it->second);
+    }
+    s.painted = std::move(painted);
     recordSeen();
     updateTrails();
     rebuildList();
@@ -1263,6 +1456,13 @@ void init(double homeLat, double homeLon, int radiusNm) {
     lv_obj_align(s_groundOpts[i], LV_ALIGN_TOP_LEFT, 0, 46 + i * (kButtonH + 4));
     lv_obj_set_style_bg_color(s_groundOpts[i], kRing, LV_STATE_CHECKED);
   }
+  constexpr int kHalfW = (kInnerW - 8 - 4) / 2, kTogglesY = 46 + 3 * (kButtonH + 4) + 6;
+  s_sweepBtn = button(s_config, "Sweep", &lv_font_montserrat_14, 0, kHalfW, onSweepClicked, 0);
+  lv_obj_align(s_sweepBtn, LV_ALIGN_TOP_LEFT, 0, kTogglesY);
+  lv_obj_set_style_bg_color(s_sweepBtn, kRing, LV_STATE_CHECKED);
+  s_metricBtn = button(s_config, "Metric", &lv_font_montserrat_14, 0, kHalfW, onMetricClicked, 0);
+  lv_obj_align(s_metricBtn, LV_ALIGN_TOP_LEFT, kHalfW + 4, kTogglesY);
+  lv_obj_set_style_bg_color(s_metricBtn, kRing, LV_STATE_CHECKED);
   lv_obj_t* done = button(s_config, "Done", &lv_font_montserrat_14, 0, kInnerW - 8, onConfigClicked, 0);
   lv_obj_align(done, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
@@ -1315,6 +1515,7 @@ void init(double homeLat, double homeLon, int radiusNm) {
   updateGroundButtons();
 
   lv_timer_create(tick, 250, nullptr);
+  lv_timer_create(sweepTick, kSweepFrameMs, nullptr);
 }
 
 void setHome(double lat, double lon, int radiusNm) {
@@ -1338,6 +1539,20 @@ void setZoom(int level) {
 }
 
 void onZoomChosen(void (*cb)(int level)) { s_zoomChosen = cb; }
+
+void setSweep(bool on) {
+  std::lock_guard<std::mutex> g(s_inMutex);
+  s_inSweep = on;
+}
+
+void onSweepChosen(void (*cb)(bool on)) { s_sweepChosen = cb; }
+
+void setUnits(bool metric) {
+  std::lock_guard<std::mutex> g(s_inMutex);
+  s_inMetric = metric;
+}
+
+void onUnitsChosen(void (*cb)(bool metric)) { s_unitsChosen = cb; }
 
 void setNet(Net net, const std::string& message) {
   std::lock_guard<std::mutex> g(s_inMutex);

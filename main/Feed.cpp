@@ -116,6 +116,7 @@ bool parseAircraft(const cJSON* ac, const Config& cfg, Aircraft& a) {
   a.squawk = str(ac, "squawk");
   const std::string emergency = str(ac, "emergency");
   a.emergency = !emergency.empty() && emergency != "none";
+  a.rotorcraft = str(ac, "category") == "A7";
 
   // alt_baro is a number, or the string "ground".
   const cJSON* alt = cJSON_GetObjectItemCaseSensitive(ac, "alt_baro");

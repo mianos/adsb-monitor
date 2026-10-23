@@ -20,6 +20,7 @@ struct Aircraft {
   float gsKt = -1;  // ground speed, -1 unknown
   int vrateFpm = 0;
   bool emergency = false;
+  bool rotorcraft = false;  // ADS-B emitter category A7
   double lat = 0, lon = 0;
   float distNm = 0;
   float bearing = 0;  // degrees true from home

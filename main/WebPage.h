@@ -38,6 +38,9 @@ td,th{text-align:left;padding:.25rem .4rem;border-bottom:1px solid #eee}
 <small>Aircraft within this distance are fetched; it is also the radar's outer ring. Tap empty radar to zoom in.</small></label>
 <label>On the ground<select name="ground"><option value="1">Group into count badges</option><option value="2">Show each one</option><option value="0">Hide</option></select>
 <small>Parked aircraft crowd airports. Grouped badges split apart as you zoom in.</small></label>
+<label>Units<select name="units"><option value="0">Aviation (ft, nm, kt)</option><option value="1">Metric (m, km, km/h)</option></select></label>
+<label>Radar sweep<select name="sweep"><option value="1">On</option><option value="0">Off</option></select>
+<small>With the sweep on, each aircraft moves when the beam passes it.</small></label>
 </fieldset>
 <fieldset><legend>Data source</legend>
 <label>Provider<select name="provider"></select></label>
@@ -53,7 +56,7 @@ adsb.lol allows 500 requests a day without a key. Headers are visible to anyone 
 <table><thead><tr><th>Flight</th><th>Type</th><th>Alt ft</th><th>nm</th><th>Brg</th></tr></thead><tbody id="ac"></tbody></table>
 <script>
 const f=document.getElementById('f'),st=document.getElementById('status');
-const ints=['radius_nm','brightness','ground'];
+const ints=['radius_nm','brightness','ground','units','sweep'];
 const pv=f.elements.provider,pt=f.elements.providers;
 function table(){try{const t=JSON.parse(pt.value);return t&&typeof t==='object'&&!Array.isArray(t)?t:null;}catch(e){return null;}}
 function options(want){const t=table();if(!t)return;const keep=want??pv.value;pv.replaceChildren();

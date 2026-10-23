@@ -102,6 +102,8 @@ void WebApi::populate_healthz_fields(WebContext*, JsonWrapper& json) {
   json.AddItem("partition", std::string(esp_ota_get_running_partition()->label));
   json.AddItem("uptime_s", static_cast<int>(esp_timer_get_time() / 1000000));
   json.AddItem("heap_free", static_cast<int>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+  json.AddItem("heap_min", static_cast<int>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)));
+  json.AddItem("heap_largest", static_cast<int>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
   json.AddItem("psram_free", static_cast<int>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
   json.AddItem("reset_reason", std::string(resetReasonName(esp_reset_reason())));
   json.AddItem("aircraft", static_cast<int>(feed::latest()->aircraft.size()));

@@ -21,6 +21,12 @@ void onGroundChosen(void (*cb)(Ground mode));
 // Zoom level 0 (full range), 1 (half) or 2 (quarter); the "zoom" setting.
 void setZoom(int level);
 void onZoomChosen(void (*cb)(int level));
+// The decorative rotating sweep line; the "sweep" setting.
+void setSweep(bool on);
+void onSweepChosen(void (*cb)(bool on));
+// Metric (m, km, km/h) or aviation units (ft, nm, kt); the "units" setting.
+void setUnits(bool metric);
+void onUnitsChosen(void (*cb)(bool metric));
 // Thread-safe; applied on the next UI tick. A non-empty message is shown across
 // the scope (provisioning, Wi-Fi reset).
 void setNet(Net net, const std::string& message);

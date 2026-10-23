@@ -14,9 +14,12 @@ and a rectangular one over the panel:
 
 - **Radar (left):** you're in the middle, north is up, and there are three range
   rings with their distance in nautical miles. Nothing is drawn in the corners
-  outside the circle. Each plane is a small arrow pointing the way it's flying,
-  with its callsign next to it, and it moves steadily between updates. A
-  fading trail shows where it's been. The colour shows the altitude:
+  outside the circle. Each plane is a small plane shape pointing the way it's
+  flying, and each helicopter a dot with a rotor cross, with the callsign next
+  to it. A fading trail shows where it's been. A sweep line goes round every
+  4 seconds, and each aircraft moves, or first appears, as the beam passes it.
+  With the sweep turned off, aircraft move steadily between updates instead.
+  The colour shows the altitude:
   - grey: on the ground
   - orange: below 2,000 ft
   - yellow: below 10,000 ft
@@ -25,11 +28,12 @@ and a rectangular one over the panel:
   - purple: 30,000 ft and above
   - red: the plane is squawking an emergency
 
-  In the list, altitudes above 18,000 ft are shown as flight levels, for
+  Units are feet, nautical miles and knots, as in aviation, unless Metric is
+  on. In the list, altitudes above 18,000 ft are shown as flight levels, for
   example FL350.
 - **List (top right):** the aircraft on the radar, up to 30, one line each with
   callsign, altitude (with an arrow if it is climbing or descending) and
-  distance in nm. Flying aircraft come first, nearest
+  distance. Flying aircraft come first, nearest
   first, then those on the ground. Zooming in shortens the list to match, and
   the status line says how many of the flying aircraft are in view. Swipe to
   scroll.
@@ -52,8 +56,9 @@ Touch:
   of the range. Tapping the radar at ¼ takes it back to full range. The range
   is remembered across restarts.
 - **Tap the gear** to choose how aircraft on the ground are shown: grouped into
-  count badges, each one, or hidden. The choice is saved, the same as on the
-  settings page. Tap **Done** or the gear again to go back to the list.
+  count badges, each one, or hidden, and to turn the **Sweep** and **Metric**
+  units on or off. The choices are saved, the same as on the settings page.
+  Tap **Done** or the gear again to go back to the list.
 
 ## First start
 
@@ -73,6 +78,7 @@ Open `http://adsb/` or `http://adsb.mianos.com/`. You can change:
 - screen brightness
 - time zone
 - your location, and the radius to show (1 to 250 nm)
+- how aircraft on the ground are shown, the units, and the radar sweep
 - where the data comes from (see [Data providers](#data-providers))
 
 Changing the network name restarts the monitor. Every other change applies

@@ -19,7 +19,9 @@
 #include "Settings.h"
 #include "Ui.h"
 #include "WebApi.h"
+#include "cJSON.h"
 #include "driver/gpio.h"
+#include "esp_heap_caps.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
@@ -64,6 +66,15 @@ void initNvs() {
   ESP_ERROR_CHECK(err);
 }
 
+// A poll parses into thousands of small nodes; in internal RAM they would
+// squeeze out Wi-Fi's buffers.
+void jsonToPsram() {
+  cJSON_Hooks hooks = {};
+  hooks.malloc_fn = [](size_t n) { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); };
+  hooks.free_fn = free;
+  cJSON_InitHooks(&hooks);
+}
+
 void onIpEvent(void*, esp_event_base_t base, int32_t id, void*) {
   if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) s_net = ui::Net::Online;
 }
@@ -94,6 +105,7 @@ void initBootKey() {
 
 extern "C" void app_main(void) {
   LogBuffer::install();
+  jsonToPsram();
   initNvs();
   static NvsStorageManager nvs;
   static Settings settings(nvs);

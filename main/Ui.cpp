@@ -4,9 +4,9 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <deque>
 #include <mutex>
 #include <numeric>
 #include <unordered_map>
@@ -55,6 +55,11 @@ constexpr uint32_t kSweepFrameMs = 66;
 constexpr lv_opa_t kSweepOpa[] = {LV_OPA_50, LV_OPA_30, LV_OPA_20, LV_OPA_10};
 constexpr float kSweepGap = 3 * 3.14159265f / 180;
 constexpr float kSweepTrail = kSweepGap * (sizeof kSweepOpa - 1);
+constexpr float kTwoPi = 2 * 3.14159265f;
+// A blip is brightest just after the beam paints it and fades until the next
+// pass, in steps so that each frame repaints the few crossing a step, not all.
+constexpr int kGlowSteps = 8;
+constexpr lv_opa_t kGlowFloor = LV_OPA_40;
 
 const lv_color_t kBg = lv_color_hex(0x000000);
 const lv_color_t kRing = lv_color_hex(0x1f4d2b);
@@ -79,6 +84,32 @@ struct Cluster {
   int count;
 };
 
+// Per-aircraft bookkeeping lives in PSRAM: internal RAM is nearly full and
+// Wi-Fi wants what is left. Exceptions are off, so a failed allocation aborts.
+template <class T>
+struct Psram {
+  using value_type = T;
+  using is_always_equal = std::true_type;
+  Psram() = default;
+  template <class U>
+  Psram(const Psram<U>&) {}
+  T* allocate(size_t n) {
+    void* p = heap_caps_malloc(n * sizeof(T), MALLOC_CAP_SPIRAM);
+    if (!p) abort();
+    return static_cast<T*>(p);
+  }
+  void deallocate(T* p, size_t) { heap_caps_free(p); }
+  template <class U>
+  bool operator==(const Psram<U>&) const { return true; }
+  template <class U>
+  bool operator!=(const Psram<U>&) const { return false; }
+};
+template <class T>
+using PsVector = std::vector<T, Psram<T>>;
+template <class V>
+using HexMap = std::unordered_map<std::string, V, std::hash<std::string>, std::equal_to<std::string>,
+                                  Psram<std::pair<const std::string, V>>>;
+
 // Owned by the LVGL task (draw and event callbacks, the tick timer).
 struct State {
   double homeLat = 0, homeLon = 0;
@@ -90,17 +121,17 @@ struct State {
   std::shared_ptr<const Snapshot> snap = std::make_shared<Snapshot>();
   uint32_t generation = 0;
   std::string selected;  // hex
-  std::unordered_map<std::string, std::deque<Point>> trails;
+  HexMap<PsVector<Point>> trails;
   // Where each aircraft was shown when its latest fix arrived, relative to that
   // fix, so the marker eases over rather than jumps.
   struct Ease {
     float eastNm, northNm;
     int64_t sinceUs;
   };
-  std::unordered_map<std::string, Ease> ease;
-  std::unordered_map<std::string, int> labelSpot;  // last spot used, so labels don't flip about
+  HexMap<Ease> ease;
+  HexMap<int> labelSpot;  // last spot used, so labels don't flip about
   // With the sweep on, each aircraft stays where the beam last painted it, as on a real scope.
-  std::unordered_map<std::string, Point> painted;
+  HexMap<Point> painted;
   std::vector<std::string> rowHex;
   Net net = Net::Connecting;
   std::string message;
@@ -232,7 +263,7 @@ void position(const Aircraft& a, float& eastNm, float& northNm) {
 void reckoned(const Aircraft& a, int64_t nowUs, float& eastNm, float& northNm) {
   position(a, eastNm, northNm);
   if (a.onGround || a.gsKt <= 0 || !a.hasTrack) return;
-  const float ageS = std::clamp((nowUs - s.snap->fetchedUs) / 1e6f, 0.0f, kReckonMaxS);
+  const float ageS = std::clamp((nowUs - s.snap->fetchedUs) / 1e6f + a.posAgeS, 0.0f, kReckonMaxS);
   const float nm = a.gsKt * ageS / 3600;
   eastNm += nm * std::sin(a.track * geo::kDeg);
   northNm += nm * std::cos(a.track * geo::kDeg);
@@ -267,8 +298,8 @@ bool unpainted(const Aircraft& a) { return s_sweepOn && !s.painted.count(a.hex);
 
 // Called with the new snapshot in place and shown holding where each aircraft
 // was drawn a moment before it arrived.
-void startEasing(const std::unordered_map<std::string, Point>& shown, int64_t nowUs) {
-  std::unordered_map<std::string, State::Ease> next;
+void startEasing(const HexMap<Point>& shown, int64_t nowUs) {
+  HexMap<State::Ease> next;
   for (const Aircraft& a : s.snap->aircraft) {
     auto it = shown.find(a.hex);
     if (it == shown.end()) continue;
@@ -302,21 +333,24 @@ const char* climbSymbol(const Aircraft& a) {
 }
 
 void drawLabel(lv_layer_t* layer, const char* text, const lv_font_t* font, lv_color_t color, int x, int y,
-               int w = 120) {
+               int w = 120, lv_opa_t opa = LV_OPA_COVER) {
   lv_draw_label_dsc_t d;
   lv_draw_label_dsc_init(&d);
   d.text = text;
   d.text_local = 1;
   d.font = font;
   d.color = color;
+  d.opa = opa;
   lv_area_t area = {x, y, x + w, y + lv_font_get_line_height(font)};
   lv_draw_label(layer, &d, &area);
 }
 
-void drawRing(lv_layer_t* layer, float x, float y, int radius, int width, lv_color_t color) {
+void drawRing(lv_layer_t* layer, float x, float y, int radius, int width, lv_color_t color,
+              lv_opa_t opa = LV_OPA_COVER) {
   lv_draw_arc_dsc_t d;
   lv_draw_arc_dsc_init(&d);
   d.color = color;
+  d.opa = opa;
   d.width = width;
   d.radius = radius;
   d.start_angle = 0;
@@ -381,12 +415,23 @@ struct Marker {
   float track;  // radians
   bool arrow, ground, selected, heli;
   lv_color_t color;
+  lv_opa_t opa;
 };
 struct Callout {
   lv_area_t area;
   std::string text;
   lv_color_t color;
+  lv_opa_t opa;
 };
+
+// How bright a blip at this position is now, from how far the beam has gone past
+// it. The selected one stays bright so it can be found.
+lv_opa_t glow(float eastNm, float northNm, bool selected) {
+  if (!s_sweepOn || selected) return LV_OPA_COVER;
+  const float behind = std::fmod(s_sweepAngle - std::atan2(eastNm, northNm) + 2 * kTwoPi, kTwoPi);
+  const int step = std::min(static_cast<int>(behind * kGlowSteps / kTwoPi), kGlowSteps - 1);
+  return LV_OPA_COVER - step * (LV_OPA_COVER - kGlowFloor) / (kGlowSteps - 1);
+}
 struct Layout {
   float viewNm = 0;
   std::vector<Segment> trails;
@@ -450,9 +495,10 @@ void computeLayout() {
     if (!drawnPosition(a, now, east, north)) continue;
     toScope(east, north, x, y);
     if (std::hypot(x, y) > kVisibleR) continue;  // reckoned out of the window
+    const bool selected = a.hex == s.selected;
     l.markers.push_back({static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)),
-                         static_cast<float>(a.track * geo::kDeg), a.hasTrack && !a.onGround, a.onGround,
-                         a.hex == s.selected, a.rotorcraft && !a.onGround, altColor(a)});
+                         static_cast<float>(a.track * geo::kDeg), a.hasTrack && !a.onGround, a.onGround, selected,
+                         a.rotorcraft && !a.onGround, altColor(a), glow(east, north, selected)});
   }
 
   // Callouts: the selected aircraft, then nearest first, each in the first of four
@@ -464,7 +510,7 @@ void computeLayout() {
   for (const Aircraft& a : s.snap->aircraft) {
     if (a.hex != s.selected) order.push_back(&a);
   }
-  std::unordered_map<std::string, int> spotUsed;
+  HexMap<int> spotUsed;
   char buf[48];
   for (const Aircraft* a : order) {
     if (a->distNm > limit || !drawnSingly(*a)) continue;
@@ -489,7 +535,8 @@ void computeLayout() {
       if (!inWindow(area, 0, 0) ||
           std::any_of(taken.begin(), taken.end(), [&](const lv_area_t& t) { return overlaps(t, area); }))
         continue;
-      l.callouts.push_back({area, buf, a->hex == s.selected ? kSelect : altColor(*a)});
+      const bool selected = a->hex == s.selected;
+      l.callouts.push_back({area, buf, selected ? kSelect : altColor(*a), glow(east, north, selected)});
       taken.push_back(area);
       spotUsed[a->hex] = i;
       break;
@@ -526,11 +573,11 @@ std::vector<Piece> pieces(const Layout& l) {
   for (const Marker& m : l.markers) {
     const int reach = m.selected ? 15 : 10;  // the selection ring is the widest part
     const lv_area_t a = {m.x - reach, m.y - reach, m.x + reach, m.y + reach};
-    uint64_t h = mix(mix(mix(3, a), static_cast<int32_t>(m.track * 1000)), m.color);
+    uint64_t h = mix(mix(mix(mix(3, a), static_cast<int32_t>(m.track * 1000)), m.color), m.opa);
     out.push_back({mix(h, m.heli << 3 | m.arrow << 2 | m.ground << 1 | m.selected), a});
   }
   for (const Callout& c : l.callouts) {
-    uint64_t h = mix(mix(4, c.area), c.color);
+    uint64_t h = mix(mix(mix(4, c.area), c.color), c.opa);
     for (char ch : c.text) h = mix(h, ch);
     out.push_back({h, c.area});
   }
@@ -714,10 +761,11 @@ void drawScope(lv_event_t* e) {
     const float c = std::cos(heading), sn = std::sin(heading);
     auto at = [&](float x, float y) { return pt(px + x * c + y * sn, py + x * sn - y * c); };
     if (m.heli) {
-      drawRing(layer, px, py, 2, 3, m.color);
+      drawRing(layer, px, py, 2, 3, m.color, m.opa);
       lv_draw_line_dsc_t l;
       lv_draw_line_dsc_init(&l);
       l.color = m.color;
+      l.opa = m.opa;
       l.width = 2;
       l.p1 = at(0, 0);
       l.p2 = at(0, -8);  // tail boom
@@ -731,6 +779,7 @@ void drawScope(lv_event_t* e) {
       lv_draw_line(layer, &l);
     } else if (m.arrow) {
       tri.bg_color = m.color;
+      tri.bg_opa = m.opa;
       constexpr float kPlane[][3][2] = {
           {{0, 9}, {-1.5f, -6}, {1.5f, -6}},   // fuselage
           {{0, 3}, {-8, -2}, {8, -2}},         // wings
@@ -741,7 +790,7 @@ void drawScope(lv_event_t* e) {
         lv_draw_triangle(layer, &tri);
       }
     } else {
-      drawRing(layer, px, py, m.ground ? 2 : 4, m.ground ? 3 : 4, m.color);
+      drawRing(layer, px, py, m.ground ? 2 : 4, m.ground ? 3 : 4, m.color, m.opa);
     }
     if (m.selected) drawRing(layer, px, py, 13, 2, kSelect);
   }
@@ -749,7 +798,7 @@ void drawScope(lv_event_t* e) {
   for (const Callout& c : s_layout.callouts) {
     if (!inStrip(c.area)) continue;
     drawLabel(layer, c.text.c_str(), kRadarFont, c.color, c.area.x1 + cx, c.area.y1 + cy,
-              lv_area_get_width(&c.area));
+              lv_area_get_width(&c.area), c.opa);
   }
 }
 
@@ -777,7 +826,6 @@ void invalidateWedge(float from, float to) {
 }
 
 void sweepTick(lv_timer_t*) {
-  constexpr float kTwoPi = 2 * 3.14159265f;
   if (!s_sweepOn) return;
   const float was = s_sweepAngle;
   s_sweepAngle = kTwoPi * (esp_timer_get_time() % kSweepPeriodUs) / kSweepPeriodUs;
@@ -792,16 +840,14 @@ void sweepTick(lv_timer_t*) {
   }
 
   const int64_t now = esp_timer_get_time();
-  bool repaint = false;
   for (const Aircraft& a : s.snap->aircraft) {
     Point p;
     shownPosition(a, now, p.eastNm, p.northNm);
     float behind = std::fmod(s_sweepAngle - std::atan2(p.eastNm, p.northNm) + 2 * kTwoPi, kTwoPi);
     if (!stalled && behind >= moved) continue;
     s.painted[a.hex] = p;
-    repaint = true;
   }
-  if (repaint) updateScope();
+  updateScope();  // the blips fade as the beam goes round, even between paints
 }
 
 void applySweep(bool on) {
@@ -1070,7 +1116,7 @@ void onConfigClicked(lv_event_t*) {
 }
 
 void updateTrails() {
-  std::unordered_map<std::string, std::deque<Point>> next;
+  HexMap<PsVector<Point>> next;
   for (const Aircraft& a : s.snap->aircraft) {
     auto& pts = next[a.hex];
     auto it = s.trails.find(a.hex);
@@ -1079,7 +1125,7 @@ void updateTrails() {
     position(a, p.eastNm, p.northNm);
     if (pts.empty() || std::hypot(p.eastNm - pts.back().eastNm, p.northNm - pts.back().northNm) > 0.02f) {
       pts.push_back(p);
-      if (pts.size() > kTrailLen) pts.pop_front();
+      if (pts.size() > kTrailLen) pts.erase(pts.begin());
     }
   }
   s.trails = std::move(next);
@@ -1292,7 +1338,7 @@ void tick(lv_timer_t*) {
   const int64_t now = esp_timer_get_time();
   if (gen != s.generation) {
     s.generation = gen;
-    std::unordered_map<std::string, Point> shown;
+    HexMap<Point> shown;
     for (const Aircraft& a : s.snap->aircraft) {
       if (a.onGround) continue;
       Point& p = shown[a.hex];
@@ -1300,7 +1346,7 @@ void tick(lv_timer_t*) {
     }
     s.snap = feed::latest();
     startEasing(shown, now);
-    std::unordered_map<std::string, Point> painted;
+    HexMap<Point> painted;
     for (const Aircraft& a : s.snap->aircraft) {
       auto it = s.painted.find(a.hex);
       if (it != s.painted.end()) painted.emplace(a.hex, it->second);

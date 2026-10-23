@@ -17,8 +17,9 @@ and a rectangular one over the panel:
   outside the circle. Each plane is a small plane shape pointing the way it's
   flying, and each helicopter a dot with a rotor cross, with the callsign next
   to it. A fading trail shows where it's been. A sweep line goes round every
-  4 seconds, and each aircraft moves, or first appears, as the beam passes it.
-  With the sweep turned off, aircraft move steadily between updates instead.
+  4 seconds, and each aircraft moves, or first appears, as the beam passes it,
+  then dims until the next pass, like the glow on a real scope. With the sweep
+  turned off, aircraft move steadily between updates instead.
   The colour shows the altitude:
   - grey: on the ground
   - orange: below 2,000 ft

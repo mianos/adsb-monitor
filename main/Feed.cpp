@@ -136,6 +136,7 @@ bool parseAircraft(const cJSON* ac, const Config& cfg, Aircraft& a) {
     a.track = v;
   }
   if (num(ac, "gs", v)) a.gsKt = v;
+  if (num(ac, "seen_pos", v) && v > 0) a.posAgeS = v;
   if (num(ac, "baro_rate", v) || num(ac, "geom_rate", v)) a.vrateFpm = static_cast<int>(v);
   geo::rangeBearing(cfg.lat, cfg.lon, a.lat, a.lon, a.distNm, a.bearing);
   return true;

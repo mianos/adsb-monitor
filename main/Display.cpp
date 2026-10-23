@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -41,19 +42,48 @@ void flush(lv_display_t* disp, const lv_area_t* area, uint8_t* px) {
   esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, px);
 }
 
-void readTouch(lv_indev_t*, lv_indev_data_t* data) {
-  esp_lcd_touch_point_data_t pt[1];
-  uint8_t count = 0;
-  if (esp_lcd_touch_read_data(s_touch) == ESP_OK &&
-      esp_lcd_touch_get_data(s_touch, pt, &count, 1) == ESP_OK && count > 0) {
-    // FT6336U reports in the panel's portrait frame; Freenove's landscape sketches
-    // map it as x = raw y, y = 320 - raw x.
-    data->point.x = pt[0].y;
-    data->point.y = board::kPanelW - 1 - pt[0].x;
-    data->state = LV_INDEV_STATE_PRESSED;
-  } else {
-    data->state = LV_INDEV_STATE_RELEASED;
+struct Touch {
+  int16_t x, y;
+  bool pressed;
+};
+QueueHandle_t s_touches = nullptr;
+constexpr uint32_t kTouchPollMs = 10;
+
+// The controller is polled on its own task, so a tap that starts and ends inside
+// one long render pass still reaches LVGL as a press followed by a release.
+void touchTask(void*) {
+  Touch last = {0, 0, false};
+  while (true) {
+    esp_lcd_touch_point_data_t pt[1];
+    uint8_t count = 0;
+    Touch t = last;
+    t.pressed = esp_lcd_touch_read_data(s_touch) == ESP_OK &&
+                esp_lcd_touch_get_data(s_touch, pt, &count, 1) == ESP_OK && count > 0;
+    if (t.pressed) {
+      // FT6336U reports in the panel's portrait frame; Freenove's landscape sketches
+      // map it as x = raw y, y = 320 - raw x.
+      t.x = pt[0].y;
+      t.y = board::kPanelW - 1 - pt[0].x;
+    }
+    if (t.pressed != last.pressed || (t.pressed && (t.x != last.x || t.y != last.y))) {
+      if (xQueueSend(s_touches, &t, 0) != pdTRUE) {
+        Touch dropped;  // the oldest; losing the newest could leave a release unseen
+        xQueueReceive(s_touches, &dropped, 0);
+        xQueueSend(s_touches, &t, 0);
+      }
+      last = t;
+    }
+    vTaskDelay(pdMS_TO_TICKS(kTouchPollMs));
   }
+}
+
+void readTouch(lv_indev_t*, lv_indev_data_t* data) {
+  static Touch last = {0, 0, false};
+  xQueueReceive(s_touches, &last, 0);
+  data->point.x = last.x;
+  data->point.y = last.y;
+  data->state = last.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+  data->continue_reading = uxQueueMessagesWaiting(s_touches) > 0;
 }
 
 uint32_t tickMs() { return esp_timer_get_time() / 1000; }
@@ -171,6 +201,10 @@ void initTouch() {
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_display(indev, s_disp);
   lv_indev_set_read_cb(indev, readTouch);
+  lv_timer_set_period(lv_indev_get_read_timer(indev), kTouchPollMs);
+  s_touches = xQueueCreate(32, sizeof(Touch));
+  // Above the LVGL task on the same core, so a render pass can't delay a poll.
+  xTaskCreatePinnedToCore(touchTask, "touch", 3072, nullptr, 5, nullptr, 1);
 }
 
 }  // namespace

@@ -32,7 +32,7 @@ constexpr int kPanelW = board::kWidth - kScope;
 // Margin inside the panel's rectangular window, so its frame doesn't cover text.
 constexpr int kInset = 4;
 constexpr int kInnerW = kPanelW - 2 * kInset;
-constexpr int kControlsH = 96;
+constexpr int kControlsH = 104;
 constexpr int kListH = board::kHeight - 2 * kInset - kControlsH;
 constexpr int kRowH = 24;
 constexpr int kMaxRows = 30;
@@ -58,8 +58,10 @@ constexpr float kSweepTrail = kSweepGap * (sizeof kSweepOpa - 1);
 constexpr float kTwoPi = 2 * 3.14159265f;
 // A blip is brightest just after the beam paints it and fades until the next
 // pass, in steps so that each frame repaints the few crossing a step, not all.
-constexpr int kGlowSteps = 8;
+constexpr int kGlowSteps = 4;
 constexpr lv_opa_t kGlowFloor = LV_OPA_40;
+// The list sits beside the dimmed blips, so at full brightness it shouts.
+constexpr lv_opa_t kListOpa = LV_OPA_70;
 
 const lv_color_t kBg = lv_color_hex(0x000000);
 const lv_color_t kRing = lv_color_hex(0x1f4d2b);
@@ -1002,6 +1004,7 @@ void rowText(lv_layer_t* layer, const char* text, const lv_font_t* font, lv_colo
   d.text = text;
   d.font = font;
   d.color = color;
+  d.opa = kListOpa;
   d.align = align;
   d.flag = LV_TEXT_FLAG_EXPAND;
   std::string cut;
@@ -1371,13 +1374,17 @@ lv_obj_t* plainBox(lv_obj_t* parent) {
   return o;
 }
 
-constexpr int kButtonH = 28;
+constexpr int kButtonH = 28;  // the gear menu stacks five rows, so no taller
+constexpr int kBarButtonH = 36;
 
 lv_obj_t* button(lv_obj_t* parent, const char* text, const lv_font_t* font, int x, int w, lv_event_cb_t cb,
-                 intptr_t arg) {
+                 intptr_t arg, int h = kButtonH) {
   lv_obj_t* b = lv_button_create(parent);
   lv_obj_remove_style_all(b);
-  lv_obj_set_size(b, w, kButtonH);
+  lv_obj_set_size(b, w, h);
+  // A fingertip is wider than these buttons and the touch controller reports
+  // its centre, so a touch just outside the drawn edge still counts.
+  lv_obj_set_ext_click_area(b, 4);
   lv_obj_set_style_radius(b, 6, 0);
   lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(b, kButton, 0);
@@ -1545,18 +1552,19 @@ void init(double homeLat, double homeLon, int radiusNm) {
   lv_obj_align(s_link, LV_ALIGN_TOP_LEFT, 2, 34);
 
   // [-] range [+] [settings]; "+" zooms in (a smaller range), as on a map.
-  constexpr int kZoomW = 32, kRangeW = 56, kConfigW = kInnerW - 2 * kZoomW - kRangeW - 2;
-  s_zoomOut = button(controls, LV_SYMBOL_MINUS, &lv_font_montserrat_14, 0, kZoomW, onZoomClicked, -1);
-  s_zoomIn = button(controls, LV_SYMBOL_PLUS, &lv_font_montserrat_14, kZoomW + kRangeW, kZoomW, onZoomClicked, 1);
-  s_configBtn =
-      button(controls, LV_SYMBOL_SETTINGS, &lv_font_montserrat_14, kInnerW - kConfigW, kConfigW, onConfigClicked, 0);
+  constexpr int kZoomW = 35, kRangeW = 50, kConfigW = kInnerW - 2 * kZoomW - kRangeW - 2;
+  s_zoomOut = button(controls, LV_SYMBOL_MINUS, &lv_font_montserrat_14, 0, kZoomW, onZoomClicked, -1, kBarButtonH);
+  s_zoomIn = button(controls, LV_SYMBOL_PLUS, &lv_font_montserrat_14, kZoomW + kRangeW, kZoomW, onZoomClicked, 1,
+                    kBarButtonH);
+  s_configBtn = button(controls, LV_SYMBOL_SETTINGS, &lv_font_montserrat_14, kInnerW - kConfigW, kConfigW,
+                       onConfigClicked, 0, kBarButtonH);
   lv_obj_set_style_bg_color(s_configBtn, kButtonPressed, LV_STATE_CHECKED);
   s_range = lv_label_create(controls);
   lv_obj_set_width(s_range, kRangeW);
   lv_obj_set_style_text_align(s_range, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(s_range, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(s_range, kRingText, 0);
-  lv_obj_align(s_range, LV_ALIGN_BOTTOM_LEFT, kZoomW, -8);
+  lv_obj_align(s_range, LV_ALIGN_BOTTOM_LEFT, kZoomW, -12);
   updateRange();
   updateGroundButtons();
 
